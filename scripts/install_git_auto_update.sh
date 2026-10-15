@@ -12,7 +12,9 @@ source_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$source_dir/git_auto_update.py" ] && [ ! -L "$source_dir/git_auto_update.py" ] || { echo 'Keep this installer and git_auto_update.py from the same pinned release together.' >&2; exit 1; }
 [ -d /opt/omnicrm-pilot ] && [ ! -L /opt/omnicrm-pilot ] && [ -f /opt/omnicrm-pilot/.env.pilot ] && [ ! -L /opt/omnicrm-pilot/.env.pilot ] || { echo 'An existing private pilot and its original .env.pilot are required.' >&2; exit 1; }
 # Existing script validates its local Docker context, runtime and loopback address.
-if ! bash /opt/omnicrm-pilot/scripts/server_pilot.sh status >/dev/null 2>&1; then
+# An older pilot's docker exec can forward stdin. Do not let it consume the
+# remaining commands when this installer is invoked from an SSH heredoc.
+if ! bash /opt/omnicrm-pilot/scripts/server_pilot.sh status </dev/null >/dev/null 2>&1; then
   echo 'Existing pilot health check failed; inspect it before enabling automatic updates.' >&2
   exit 1
 fi

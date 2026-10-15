@@ -48,7 +48,9 @@ case "$action" in
     ;;
 esac
 "${compose[@]}" ps --all
-"${compose[@]}" exec -T api python -c "import json,urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready',timeout=5); r=json.load(urllib.request.urlopen('http://127.0.0.1:8080/api/runtime',timeout=5)); assert r == {'local_test': True, 'demo': False}"
+# -T disables the TTY, not stdin forwarding. Keep any caller's streamed script
+# out of the container: this health check never needs input.
+"${compose[@]}" exec -T api python -c "import json,urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready',timeout=5); r=json.load(urllib.request.urlopen('http://127.0.0.1:8080/api/runtime',timeout=5)); assert r == {'local_test': True, 'demo': False}" </dev/null
 published_address="$("${compose[@]}" port api 8080)"
 case "$published_address" in 127.0.0.1:*) ;; *) echo 'Unexpected non-loopback binding.' >&2; exit 1 ;; esac
 echo "Private pilot ready on server $published_address. Open it through an authenticated SSH local forward."
