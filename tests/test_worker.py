@@ -384,3 +384,130 @@ async def test_identity_change_blocks_outbox_even_if_previous_state_was_connecte
         assert db.get(Account, worker_store.account_id).state == "reauth_required"
     assert await worker.process_outbox(worker_store.account_id, a, Mock()) is False
     a.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_startup_failure_finishes_queued_login_and_retry_reuses_account(worker_store, monkeypatch):
+    """Regression: start used to fail before the worker could even claim a job."""
+    stop = asyncio.Event()
+    with worker_store.Session.begin() as db:
+        account = db.get(Account, worker_store.account_id)
+        account.state = "disconnected"
+        original_config = account.encrypted_config
+        job = Job(account_id=account.id, action="login", encrypted_payload=seal({"phone": "+79990000001"}))
+        db.add(job)
+        db.flush()
+        first_id = job.id
+    a = fake_adapter()
+
+    async def failed_start():
+        with worker_store.Session() as db:
+            job = db.get(Job, first_id)
+            assert job.status == "running", "Network connection must happen after durable job claim"
+            assert job.encrypted_payload is None, "One-time payload must be scrubbed before connecting"
+        stop.set()
+        raise ProviderError("telegram_transport_error")
+
+    a.start.side_effect = failed_start
+    monkeypatch.setattr(worker, "adapter_for", Mock(return_value=a))
+    await asyncio.wait_for(worker.account_loop(worker_store.account_id, Mock(), stop, asyncio.Semaphore(1)), timeout=2)
+    a.auth.assert_not_awaited()
+    with worker_store.Session() as db:
+        job = db.get(Job, first_id)
+        assert job.status == "failed" and job.error == "telegram_transport_error"
+        assert job.encrypted_payload is None
+        account = db.get(Account, worker_store.account_id)
+        assert account.state == "disconnected"
+        assert account.public == {"error": "telegram_transport_error"}
+        assert unseal(account.encrypted_config) == unseal(original_config)
+        assert db.get(Conversation, worker_store.conversation_id) is not None
+
+    # An explicit retry keeps the same account/history and clears the old error
+    # only after the provider confirms the next step.
+    a.start.side_effect = None
+    a.auth.return_value = AuthResult("awaiting_code", {"phone": "+79990000001", "auth_method": "phone"})
+    with worker_store.Session.begin() as db:
+        retry = Job(account_id=worker_store.account_id, action="login", encrypted_payload=seal({}))
+        db.add(retry)
+        db.flush()
+        retry_id = retry.id
+    await worker.process_job(worker_store.account_id, a, Mock())
+    with worker_store.Session() as db:
+        assert db.get(Job, retry_id).status == "done"
+        account = db.get(Account, worker_store.account_id)
+        assert account.state == "awaiting_code" and "error" not in account.public
+        assert len(list(db.scalars(select(Account)))) == 1
+        assert db.get(Conversation, worker_store.conversation_id) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["start", "auth"])
+async def test_auth_start_timeout_is_terminal_and_scrubs_payload(worker_store, monkeypatch, phase):
+    with worker_store.Session.begin() as db:
+        db.get(Account, worker_store.account_id).state = "awaiting_password"
+        job = Job(account_id=worker_store.account_id, action="password", encrypted_payload=seal({"password": "never-return-me"}))
+        db.add(job)
+        db.flush()
+        job_id = job.id
+    a = fake_adapter()
+    cancelled = asyncio.Event()
+
+    async def blocked_start(*args):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    getattr(a, phase).side_effect = blocked_start
+    monkeypatch.setattr(worker, "AUTH_JOB_TIMEOUT", 0.01)
+    assert await worker.process_job(worker_store.account_id, a, Mock())
+    assert cancelled.is_set()
+    if phase == "start":
+        a.auth.assert_not_awaited()
+    else:
+        a.auth.assert_awaited_once()
+    with worker_store.Session() as db:
+        job = db.get(Job, job_id)
+        assert job.status == "failed" and job.error == "provider_auth_timeout"
+        assert job.encrypted_payload is None
+        account = db.get(Account, worker_store.account_id)
+        assert account.state == "awaiting_password"
+        assert account.public["error"] == "provider_auth_timeout"
+        assert "never-return-me" not in str(account.public)
+
+
+@pytest.mark.asyncio
+async def test_expired_queued_job_fails_without_attempting_network(worker_store):
+    with worker_store.Session.begin() as db:
+        job = Job(account_id=worker_store.account_id, action="code", encrypted_payload=seal({"code": "12345"}),
+                  created_at=now() - timedelta(minutes=11))
+        db.add(job)
+        db.flush()
+        job_id = job.id
+    a = fake_adapter()
+    a.start.side_effect = ProviderError("telegram_transport_error")
+    assert await worker.process_job(worker_store.account_id, a, Mock())
+    a.start.assert_not_awaited()
+    a.auth.assert_not_awaited()
+    with worker_store.Session() as db:
+        job = db.get(Job, job_id)
+        assert job.status == "failed" and job.error == "auth_job_expired" and job.encrypted_payload is None
+
+
+@pytest.mark.asyncio
+async def test_idle_disconnected_account_does_not_open_provider_connection(worker_store, monkeypatch):
+    with worker_store.Session.begin() as db:
+        db.get(Account, worker_store.account_id).state = "disconnected"
+    stop = asyncio.Event()
+    a = fake_adapter()
+
+    async def no_jobs(*args):
+        stop.set()
+        return False
+
+    monkeypatch.setattr(worker, "adapter_for", Mock(return_value=a))
+    monkeypatch.setattr(worker, "process_job", no_jobs)
+    await asyncio.wait_for(worker.account_loop(worker_store.account_id, Mock(), stop, asyncio.Semaphore(1)), timeout=2)
+    a.start.assert_not_awaited()
+    a.auth.assert_not_awaited()
+    a.poll.assert_not_awaited()

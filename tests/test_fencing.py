@@ -131,14 +131,15 @@ async def test_takeover_during_poll_keeps_committed_cursor_and_messages(fenced_s
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider_fails", [False, True])
-async def test_takeover_during_auth_cannot_replace_new_owners_session(fenced_store, provider_fails):
+@pytest.mark.parametrize("phase", ["start", "auth"])
+async def test_takeover_during_auth_cannot_replace_new_owners_session(fenced_store, provider_fails, phase):
     store = fenced_store
     with store.Session.begin() as db:
         job = Job(account_id=store.account_id, action="login", encrypted_payload=seal({}))
         db.add(job)
         db.flush()
         job_id = job.id
-    adapter = SimpleNamespace(config={"cursor": 1})
+    adapter = SimpleNamespace(config={"cursor": 1}, start=AsyncMock(), auth=AsyncMock(return_value=AuthResult("connected")))
 
     async def auth(*args):
         replace_owner(store)
@@ -147,7 +148,7 @@ async def test_takeover_during_auth_cannot_replace_new_owners_session(fenced_sto
             raise ProviderError("provider_unauthorized")
         return AuthResult("connected")
 
-    adapter.auth = AsyncMock(side_effect=auth)
+    setattr(adapter, phase, AsyncMock(side_effect=auth))
     with pytest.raises(worker.OwnershipLost):
         await worker.process_job(store.account_id, adapter, store.owner)
     with store.Session() as db:

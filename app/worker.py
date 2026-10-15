@@ -26,6 +26,7 @@ log = logging.getLogger("omnicrm.worker")
 SHARD_COUNT = int(os.getenv("WORKER_SHARD_COUNT", "16"))
 SHARDS = [int(x) for x in os.getenv("WORKER_SHARDS", ",".join(map(str, range(SHARD_COUNT)))).split(",")]
 INTERVAL = float(os.getenv("ACCOUNT_POLL_SECONDS", "3"))
+AUTH_JOB_TIMEOUT = 90
 
 
 class OwnershipLost(RuntimeError):
@@ -168,7 +169,13 @@ async def process_job(account_id, adapter, ownership):
         job.encrypted_payload = None
     ownership.check()
     try:
-        result = await asyncio.wait_for(adapter.auth(action, payload), timeout=90)
+        # Claim the job and erase its durable one-time credentials BEFORE any
+        # network connection. Otherwise a failed start leaves it queued forever,
+        # bypassing even the expiry check above on every worker retry.
+        async with asyncio.timeout(AUTH_JOB_TIMEOUT):
+            await adapter.start()
+            ownership.check()
+            result = await adapter.auth(action, payload)
         ownership.check()
         with Session.begin() as db:
             fence_transaction(db, ownership, account_id)
@@ -184,7 +191,8 @@ async def process_job(account_id, adapter, ownership):
         raise
     except Exception as exc:
         ownership.check()
-        code = exc.code if isinstance(exc, ProviderError) else "provider_auth_error"
+        code = (exc.code if isinstance(exc, ProviderError) else
+                "provider_auth_timeout" if isinstance(exc, TimeoutError) else "provider_auth_error")
         with Session.begin() as db:
             fence_transaction(db, ownership, account_id)
             job = db.get(Job, job_id)
@@ -293,7 +301,9 @@ async def account_loop(account_id, ownership, stop, semaphore):
                     with Session() as db:
                         a = db.get(Account, account_id)
                         adapter = adapter_for(a, unseal(a.encrypted_config))
-                    await asyncio.wait_for(adapter.start(), timeout=45)
+                    # Auth startup belongs inside process_job's claimed,
+                    # bounded operation. Connected adapters open lazily in poll
+                    # or send; idle/disconnected accounts do not connect here.
                 await process_job(account_id, adapter, ownership)
                 with Session() as db:
                     state = db.get(Account, account_id).state

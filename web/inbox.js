@@ -70,6 +70,10 @@ function connectionError(error) {
     telegram_qr_invalid: 'QR-код больше не действует. Получите новый код.',
     telegram_app_not_configured: 'Администратор ещё не настроил подключение Telegram для команды.',
     telegram_configuration_invalid: 'Настройки Telegram требуют проверки администратором.',
+    telegram_transport_error: 'Сервер не смог установить связь с Telegram. Повторите вход. Если ошибка повторится, администратору нужно проверить доступ сервера к Telegram.',
+    telegram_server_error: 'Telegram временно не ответил. Повторите вход немного позже.',
+    provider_auth_timeout: 'Подключение не завершилось вовремя. Повторите вход. Если ожидание повторится, попросите администратора проверить связь сервера с мессенджером.',
+    worker_interrupted_retry_login: 'Во время подключения сервер перезапустился. Повторите вход.',
     telegram_account_identity_changed: 'В этом канале был другой аккаунт. Для нового номера добавьте отдельный канал.',
     whatsapp_account_identity_changed: 'В этом канале был другой аккаунт. Для нового номера добавьте отдельный канал.',
     waha_transport_error: 'Нет связи со шлюзом WhatsApp. Повторите проверку через некоторое время.',
@@ -653,7 +657,7 @@ export class OmniInbox extends HTMLElement {
           this._connectionJobs.set(account.id, knownJob);
         }
         if (!alive()) return;
-        await this.pollJob(knownJob.id, status => { if (alive()) jobStatus.textContent = status === 'running' ? 'Мессенджер подтверждает подключение…' : 'Ожидаем подключения…'; }, alive);
+        await this.pollJob(knownJob.id, status => { if (alive()) jobStatus.textContent = status === 'running' ? 'Мессенджер подтверждает подключение…' : 'Сервер готовит подключение…'; }, alive);
         this._connectionJobs.delete(account.id);
         await fetchAccount();
         if (!alive()) return;
@@ -759,6 +763,12 @@ export class OmniInbox extends HTMLElement {
       if (!alive() || !account) return;
       const latest = this._accounts.find(item => item.id === account.id);
       if (latest) account = latest;
+      // Older workers can report a transport error while the auth job is still
+      // queued. Show it without dropping the known job or submitting a duplicate.
+      if (busy && telegram) {
+        if (account.public?.error) showError(new Error(account.public.error), 'provider');
+        else if (lastErrorSource === 'provider') showError('');
+      }
       if (!busy) render();
     };
     const expiryTimer = setInterval(() => {
@@ -859,17 +869,22 @@ export class OmniInbox extends HTMLElement {
     const key = `${this._generation}:${id}`;
     this._jobs.add(key);
     const generation = this._generation;
+    const deadline = Date.now() + 135000;
+    let lastStatus = '';
     try {
-      for (let attempt = 0; attempt < 90; attempt += 1) {
+      for (let attempt = 0; attempt < 90 && Date.now() < deadline; attempt += 1) {
         if (generation !== this._generation || !this.isConnected || !isActive()) throw new Error('Сеанс завершён.');
         const job = await this.api(`/api/jobs/${encodeURIComponent(id)}`);
         if (!isActive() || generation !== this._generation) throw new Error('Сеанс завершён.');
         if (['done', 'completed', 'succeeded'].includes(job.status)) return job;
         if (['failed', 'error'].includes(job.status)) { const error = new Error(typeof job.error === 'string' ? job.error : job.error?.message || job.result?.error || 'Провайдер не выполнил запрос.'); error.jobFailed = true; throw error; }
+        lastStatus = job.status;
         onUpdate(job.status);
         await new Promise(resolve => setTimeout(resolve, 1500));
       }
-      throw new Error('Задача всё ещё выполняется. Проверьте состояние подключения позднее; новый запрос не требуется.');
+      throw new Error(lastStatus === 'queued'
+        ? 'Сервер пока не начал подключение. Нажмите «Проверить выполнение запроса». Если ожидание повторится, обратитесь к администратору.'
+        : 'Подключение пока не подтвердилось. Нажмите «Проверить выполнение запроса», чтобы узнать результат. Повторный запрос входа не отправляется.');
     } finally { this._jobs.delete(key); }
   }
   openNewConversation() {

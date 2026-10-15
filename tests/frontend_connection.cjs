@@ -56,7 +56,10 @@ const caps = (configured = true) => [
           if (body.payload.password === 'wrong') error = 'telegram_password_invalid';
           else { account.state = 'connected'; account.public = { identity: { phone: '+79991234567', display_name: 'Тестовый менеджер' } }; }
         } else if (body.action === 'disconnect') { account.state = 'disconnected'; account.public = {}; }
-        data.jobs.set(id, { id, status: data.mode === 'pending' ? 'running' : error ? 'failed' : 'done', error });
+        if (data.mode === 'tg_queued' && account.channel === 'telegram') {
+          account.state = 'new'; account.public = { error: 'telegram_transport_error' };
+        }
+        data.jobs.set(id, { id, status: data.mode === 'tg_queued' ? 'queued' : data.mode === 'pending' ? 'running' : error ? 'failed' : 'done', error });
         return reply({ id }, 202);
       }
       if (pathname.startsWith('/api/jobs/')) { data.jobReads++; return reply(data.jobs.get(pathname.split('/').pop())); }
@@ -162,6 +165,31 @@ const caps = (configured = true) => [
     assert.deepEqual(await tg.page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length })), { local: 0, session: 0 });
     checks.push('TG phone/code/2FA, double submit guard, invalid code and password recovery, no credential storage');
     await tg.page.close();
+
+    const tgQueued = await fixture({ mode: 'tg_queued', clock: true });
+    await tgQueued.dialog.getByRole('button', { name: 'Подключить Telegram', exact: true }).click();
+    await tgQueued.dialog.getByLabel('Номер телефона *', { exact: true }).fill('+79991234567');
+    await tgQueued.dialog.getByRole('button', { name: 'Получить код', exact: true }).click();
+    await tgQueued.dialog.getByText('Сервер готовит подключение…', { exact: true }).waitFor();
+    await tgQueued.refresh();
+    await tgQueued.dialog.getByRole('alert').getByText(/Сервер не смог установить связь с Telegram/).waitFor();
+    await tgQueued.page.clock.fastForward(136000);
+    await tgQueued.page.clock.runFor(1600);
+    await tgQueued.dialog.getByRole('alert').getByText(/Сервер пока не начал подключение/).waitFor();
+    assert.equal(await tgQueued.dialog.getByRole('button', { name: 'Получить код', exact: true }).isDisabled(), true);
+    assert.equal(tgQueued.data.actions.length, 1, 'Uncertain queue timeout must not enqueue a duplicate');
+    tgQueued.data.jobs.get('job-1').status = 'failed';
+    tgQueued.data.jobs.get('job-1').error = 'telegram_transport_error';
+    await tgQueued.dialog.getByRole('button', { name: 'Проверить выполнение запроса', exact: true }).click();
+    await tgQueued.dialog.getByRole('alert').getByText(/Сервер не смог установить связь с Telegram/).waitFor();
+    assert.equal(await tgQueued.dialog.getByRole('button', { name: 'Получить код', exact: true }).isEnabled(), true);
+    tgQueued.data.mode = null;
+    await tgQueued.dialog.getByRole('button', { name: 'Получить код', exact: true }).click();
+    await tgQueued.dialog.getByLabel('Код из сообщения *').waitFor();
+    assert.equal(tgQueued.data.creates.length, 1, 'Telegram retry must retain the existing corporate channel');
+    assert.equal(tgQueued.data.actions.length, 2);
+    checks.push('TG queued transport error is visible during wait, wall-clock deadline retains pending job, terminal failure allows retry on same account');
+    await tgQueued.page.close();
 
     const qr = await fixture({ mobile: true });
     await qr.dialog.getByRole('button', { name: 'Подключить Telegram', exact: true }).click();
