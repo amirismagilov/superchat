@@ -1,0 +1,9 @@
+{
+  "name": "omnicrm-browser-contract-tests",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Pinned browser tooling for offline messenger contract tests",
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}
