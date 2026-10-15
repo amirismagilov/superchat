@@ -102,6 +102,8 @@ def test_waha_history_replays_after_crash_and_keeps_timestamp_ties(experimental)
     pages = []
 
     def handler(request):
+        if request.url.path.endswith("/chats/all/messages"):
+            return httpx.Response(200, json=[])
         if request.url.path.endswith("/chats"):
             return httpx.Response(200, json=[{"id": "7@s.whatsapp.net", "name": "Customer"}])
         offset = int(request.url.params["offset"])

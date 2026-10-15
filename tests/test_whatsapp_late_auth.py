@@ -78,7 +78,7 @@ async def run_loop(store, monkeypatch, provider, *, steps=7, on_wait=None, owner
 
     def handler(request):
         requests.append((stop.tick, request.method, request.url.path))
-        if request.url.path.endswith("/chats"):
+        if request.url.path.endswith(("/chats", "/chats/all/messages")):
             return httpx.Response(200, json=[])
         return provider(request, stop.tick)
 

@@ -90,6 +90,7 @@ def _sent_message_identity(result: object) -> tuple[str, str, dict]:
 class WhatsAppWebAdapter(Adapter):
     PAGE_SIZE = 100
     CHATS_PER_POLL = 10
+    HISTORY_OVERLAP_SECONDS = 300
     CONNECT_WAIT_SECONDS = 120
     PROVIDER_STATES = frozenset({
         "STOPPED", "STARTING", "SCAN_QR_CODE", "PASSKEY_REQUIRED",
@@ -213,6 +214,7 @@ class WhatsAppWebAdapter(Adapter):
                     self.config.pop(key)
             self.config.pop("wa_identity_mismatch", None)
             self._qr_value = self._qr_image = None
+            self._live_seen = {}
             return AuthResult("disconnected")
         if action not in {"login", "sync"}:
             raise ProviderError("unsupported_action")
@@ -303,17 +305,21 @@ class WhatsAppWebAdapter(Adapter):
         # corresponding PN/LID, as in WAHA's jidsFromKey helper.
         if peer.endswith("@c.us") and re.fullmatch(r"[0-9]+@lid", recipient):
             self.config.setdefault("_waha_lid_pn", {})[recipient] = peer
+        self._remember_peer_alias(recipient, key)
+        return message_id
+
+    def _remember_peer_alias(self, recipient: str, key: dict) -> None:
+        # Only a provider-supplied PN/LID pair can identify the same person.
         alternate = key.get("remoteJidAlt")
         alternate = _to_cus_format(alternate) if isinstance(alternate, str) else ""
         if re.fullmatch(r"[0-9]+@c\.us", recipient) and re.fullmatch(r"[0-9]+@lid", alternate):
             self.config.setdefault("_waha_lid_pn", {})[alternate] = recipient
         elif re.fullmatch(r"[0-9]+@lid", recipient) and re.fullmatch(r"[0-9]+@c\.us", alternate):
             self.config.setdefault("_waha_lid_pn", {})[recipient] = alternate
-        return message_id
 
-    async def _peer_metadata(self, peer: str) -> dict:
+    async def _peer_metadata(self, peer: str, *, resolve_lid: bool = True) -> dict:
         mappings = self.config.setdefault("_waha_lid_pn", {})
-        if peer.endswith("@lid") and peer not in mappings:
+        if resolve_lid and peer.endswith("@lid") and peer not in mappings:
             result = await self._request(
                 "GET", f"/api/{self.session}/lids/{quote(peer, safe='')}", allow_404=True,
             )
@@ -331,10 +337,56 @@ class WhatsAppWebAdapter(Adapter):
             aliases.update(lid for lid, pn in mappings.items() if pn == canonical)
         return {"canonical_peer": canonical, "aliases": sorted(aliases)}
 
+    @staticmethod
+    def _message_peer(message: dict) -> tuple[str, dict]:
+        raw = message.get("_data")
+        key = raw.get("key") if isinstance(raw, dict) else None
+        key = key if isinstance(key, dict) else {}
+        # NOWEB getFromToParticipant uses the remote chat as `from` in BOTH
+        # directions. In particular, an outgoing DM need not have `to`.
+        value = key.get("remoteJid") or message.get("from")
+        peer = _to_cus_format(value) if isinstance(value, str) else ""
+        if not re.fullmatch(r"[0-9-]+@(?:c\.us|g\.us|lid)", peer):
+            peer = ""
+        return peer, key
+
+    @staticmethod
+    def _event(message: dict, peer: str, identity: dict, name=None) -> Event:
+        if not isinstance(message, dict) or not message.get("id"):
+            raise ProviderError("waha_invalid_message")
+        outbound = bool(message.get("fromMe"))
+        ack = message.get("ack") or 0
+        status = ("read" if ack >= 3 else "delivered" if ack >= 2 else "sent") if outbound else "received"
+        return Event(
+            provider_id=str(message["id"]), peer=peer,
+            text=message.get("body") or ("[Вложение]" if message.get("hasMedia") else ""),
+            direction="outbound" if outbound else "inbound", timestamp=message.get("timestamp"),
+            peer_name=name, status=status,
+            metadata={"has_media": bool(message.get("hasMedia")), **identity},
+        )
+
     async def poll(self) -> list[Event]:
         if self.config.get("wa_identity_mismatch"):
             raise ProviderError("whatsapp_account_identity_changed")
         await self.start()
+        history_days = min(max(int(self.config.get("history_days", 30)), 1), 3650)
+        # Persistent NOWEB 2026.9.2 supports the ALL_JID sentinel (`all`) in
+        # SqlMessagesMethods.getAllByJid. Read newest messages independently of
+        # the chat list and its backlog: message/chat store writes are async.
+        # No advancing lower watermark: a late store write must remain visible.
+        live = await self._request("GET", f"/api/{self.session}/chats/all/messages", params={
+            "limit": self.PAGE_SIZE, "offset": 0,
+            "sortBy": "timestamp", "sortOrder": "desc", "downloadMedia": "false",
+            "filter.timestamp.gte": int(time.time()) - history_days * 86400,
+        })
+        if not isinstance(live, list):
+            raise ProviderError("waha_invalid_history_response")
+        for message in live:
+            if not isinstance(message, dict):
+                raise ProviderError("waha_invalid_message")
+            peer, key = self._message_peer(message)
+            if peer:
+                self._remember_peer_alias(peer, key)
         offset = int(self.config.get("_waha_chat_offset", 0))
         chats = await self._request("GET", f"/api/{self.session}/chats", params={
             "limit": self.CHATS_PER_POLL, "offset": offset,
@@ -343,17 +395,23 @@ class WhatsAppWebAdapter(Adapter):
         if not isinstance(chats, list):
             raise ProviderError("waha_invalid_chats_response")
         cursors = self.config.setdefault("_waha_cursors", {})
-        events = []
+        events = {}
+        names = {}
+        identities = {}
         for chat in chats:
             peer = _to_cus_format(str(chat.get("id", "")))
             if not re.fullmatch(r"[0-9-]+@(?:c\.us|g\.us|lid)", peer):
                 continue
+            names[peer] = chat.get("name")
             identity = await self._peer_metadata(peer)
+            identities[peer] = identity
             cursor = cursors.setdefault(peer, {})
             if "ceiling" not in cursor:
                 now = int(time.time()) - 1
-                history_days = min(max(int(self.config.get("history_days", 30)), 1), 3650)
-                cursor.update(floor=cursor.get("watermark", now - history_days * 86400), ceiling=now, offset=0)
+                floor = now - history_days * 86400
+                if "watermark" in cursor:
+                    floor = max(floor, cursor["watermark"] - self.HISTORY_OVERLAP_SECONDS)
+                cursor.update(floor=floor, ceiling=now, offset=0)
             messages = await self._request("GET", f"/api/{self.session}/chats/{quote(peer, safe='')}/messages", params={
                 "limit": self.PAGE_SIZE, "offset": cursor["offset"],
                 "sortBy": "timestamp", "sortOrder": "asc", "downloadMedia": "false",
@@ -362,27 +420,44 @@ class WhatsAppWebAdapter(Adapter):
             if not isinstance(messages, list):
                 raise ProviderError("waha_invalid_history_response")
             for message in messages:
-                if not message.get("id"):
-                    raise ProviderError("waha_invalid_message")
-                outbound = bool(message.get("fromMe"))
-                ack = message.get("ack") or 0
-                status = ("read" if ack >= 3 else "delivered" if ack >= 2 else "sent") if outbound else "received"
-                events.append(Event(
-                    provider_id=str(message["id"]), peer=peer,
-                    text=message.get("body") or ("[Вложение]" if message.get("hasMedia") else ""),
-                    direction="outbound" if outbound else "inbound", timestamp=message.get("timestamp"),
-                    peer_name=chat.get("name"), status=status,
-                    metadata={"has_media": bool(message.get("hasMedia")), **identity},
-                ))
+                event = self._event(message, peer, identity, chat.get("name"))
+                events[(identity["canonical_peer"], event.provider_id)] = event
             if len(messages) < self.PAGE_SIZE:
-                # Keep the last second inclusive to handle timestamp ties.
+                # The next window overlaps to allow delayed store writes, as
+                # well as timestamp ties. Database ingest deduplicates IDs.
                 cursors[peer] = {"watermark": cursor["ceiling"]}
             else:
                 cursor["offset"] += len(messages)
         self.config["_waha_chat_offset"] = offset + len(chats) if len(chats) == self.CHATS_PER_POLL else 0
-        return events
+        previous_live = getattr(self, "_live_seen", {})
+        current_live = {}
+        lid_lookups = 0
+        for message in reversed(live):
+            peer, _key = self._message_peer(message)
+            if not peer:  # Status, newsletter and unsupported system records.
+                continue
+            if peer not in identities:
+                unresolved = peer.endswith("@lid") and peer not in self.config.get("_waha_lid_pn", {})
+                identities[peer] = await self._peer_metadata(peer, resolve_lid=lid_lookups < self.CHATS_PER_POLL)
+                lid_lookups += unresolved
+            identity = identities[peer]
+            key = (identity["canonical_peer"], str(message.get("id", "")))
+            name = names.get(peer) or names.get(identity["canonical_peer"])
+            if not name and key in events:
+                name = events[key].peer_name
+            event = self._event(message, peer, identity, name)
+            fingerprint = (event.peer, event.direction, event.timestamp, event.text,
+                           event.status, event.metadata["has_media"], tuple(identity["aliases"]))
+            current_live[key] = fingerprint
+            if key in events or previous_live.get(key) != fingerprint:
+                events[key] = event
+        # Only a bounded in-memory cache. A worker DB failure discards this
+        # adapter, so a retry/restart replays the tail instead of losing data.
+        self._live_seen = current_live
+        return list(events.values())
 
     async def close(self) -> None:
+        self._live_seen = {}
         if getattr(self, "http", None) is not None:
             await self.http.aclose()
             self.http = None
