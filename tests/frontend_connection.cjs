@@ -96,7 +96,7 @@ const caps = (configured = true) => [
     backendTimeout.data.accounts[0].state = 'action_required';
     backendTimeout.data.accounts[0].public = { error: 'waha_connect_timeout', provider_state: 'STARTING' };
     await backendTimeout.refresh();
-    await backendTimeout.dialog.getByRole('alert').getByText(/WhatsApp не завершил подключение за 2 минуты/).waitFor();
+    await backendTimeout.dialog.getByRole('alert').getByText(/Продолжаем проверять подключение/).waitFor();
     assert.equal(await backendTimeout.dialog.locator('.connection-spinner').count(), 0);
     await backendTimeout.dialog.getByRole('button', { name: 'Подключить снова', exact: true }).click();
     await backendTimeout.dialog.getByRole('img', { name: 'QR-код подключения WhatsApp' }).waitFor();
@@ -104,6 +104,16 @@ const caps = (configured = true) => [
     assert.equal(backendTimeout.data.creates.length, 1, 'Retry must reuse the existing corporate account');
     assert.equal(await backendTimeout.dialog.getByRole('alert').count(), 0);
     checks.push('WA server deadline removes spinner, explicit retry logs in again on the same account');
+    backendTimeout.data.accounts[0].state = 'action_required';
+    backendTimeout.data.accounts[0].public = { error: 'waha_connect_timeout', provider_state: 'STARTING' };
+    await backendTimeout.refresh();
+    await backendTimeout.dialog.getByRole('heading', { name: 'Подтверждение подключения задерживается' }).waitFor();
+    backendTimeout.data.accounts[0].state = 'connected';
+    backendTimeout.data.accounts[0].public = { identity: { phone: '+79990001122' } };
+    await backendTimeout.refresh();
+    await backendTimeout.dialog.getByRole('button', { name: 'Перейти в чаты' }).waitFor();
+    assert.equal(backendTimeout.data.actions.length, 2, 'Late verified login must be displayed without another login job');
+    checks.push('WA late confirmed login replaces timeout without an extra login request');
     await backendTimeout.page.close();
 
     const stalled = await fixture({ mode: 'connecting', clock: true });

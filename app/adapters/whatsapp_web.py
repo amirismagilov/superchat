@@ -254,7 +254,13 @@ class WhatsAppWebAdapter(Adapter):
             if qr is None:
                 return self._pending(status, reset=action == "login" and self._wait_expired())
             value = qr.get("value") if isinstance(qr, dict) else None
-            if not isinstance(value, str) or not value or len(value) > 4096:
+            # NOWEB clears its QR before the delayed post-pairing restart changes
+            # SCAN_QR_CODE to STARTING. Its raw endpoint can return an empty value
+            # during that interval; it is progress to check again, not a QR to
+            # render or proof that the account has authenticated.
+            if value == "":
+                return self._pending(status, reset=action == "login" and self._wait_expired())
+            if not isinstance(value, str) or len(value) > 4096:
                 raise ProviderError("waha_invalid_qr_response")
             if value != getattr(self, "_qr_value", None):
                 from qrcode.exceptions import DataOverflowError
