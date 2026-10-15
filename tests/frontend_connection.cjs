@@ -5,9 +5,10 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const fixtureQR = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZoAAAGaAQAAAAAefbjOAAADG0lEQVR4nO2bQW6kMBBFXw2WsjRSDpCjmBvkSK0caW4AR+kDjGQvI4FqFraB7tlM1BGQprxogZonlUXpu+pji/LlMfz6OgMGGWSQQQYZZNBzQlKGg0Ec+SqP5IBUH+h2Cc+g7aGgqqoRpPOfQtARhhak8yNAo6qqegttF55B20OpCkC4vqj2SYRwdTBUZVjrxg+Zk0HfBE0iHY1KB4DXf/vTnzcng/57uLt7HdpmhDQJMIkO75NT0l7hGbQ5VDPCK5QXPwmhH13OjXB9yRqxVoqDz8mgb4AGERFpQS6xUUgvKpcI0gHSMeVWY6/wDNpaI1YCMLSIzqsGMIneKsTh52TQ45B0QPEe/IjIm6p+vJXGk0FK17FTeAZtCJGNhh4Ar6q9Hym3QL7NVkS90v7gczLoEai87pDToslX+Y/eq6rGRvNVD5YRJ4BqRkTITiWUFICcIGMWiuVhy4gTQFkAPsTNaTGJ9v5TIDnkcnVZMqTbJTyDdlo1SrlQflQjFI0AVGNTV5eDz8mgR6C6EPjlxVOEItynilWWZ4CyHyEhToD/4xjeRwfpVQVASW3+Kb3pxuEZtDlUW0uYe85GVWuNuVSWuby0VeMsUNARueRlotSThDgVSypcHUBj+yPOAw1to5BEyCbl24h+tFDsynbn8Aza/LvG0AngFYHJEeKEhCwJkyPE1xGS1M8bB5+TQY9As0PV6OJdL5vsbloPqyPOAJX+YWgRFlEgvY6l6/CjK8pQ+4/Dz8mgR6DZoZr9CJ1th+pVFR/T/IhTQOuMWIyo3GnG6l9pXD9sGfHU0MqPKCkQgWxFxNs9+V7NxT4BVFVgNqvn9SOP2cpemdqWEc8MrTViPqhTTcpFPIo5ZavGaaC53VxvnsvGJUA92CXdPuEZtIMfAYspsa42qzwsZYVpxMkgrwrJoX1ySFdbD/1oJzsJfALo/kwXIYKE35Po0IEWFxuVENvtwzNoc+hmD9ViZftaVuQ/dH1A3FaNp4bue42SDNmwGlffNdZm5sHnZNAj0P2ZrnrVlL3Y+UDocrtxeAYZZJBBBhlk0IGhvxhUkNolWGxRAAAAAElFTkSuQmCC';
-const caps = (configured = true) => [
+const caps = (configured = true, maxMethods = ['qr', 'phone'], maxEnabled = true) => [
   { channel: 'whatsapp_web', enabled: true, connection: { flow: 'qr', configured: true, methods: ['qr'] }, config_fields: [], actions: ['login', 'sync', 'disconnect'] },
   { channel: 'telegram', enabled: true, connection: { flow: 'phone_code', configured, methods: ['phone', 'qr'] }, config_fields: [{ name: 'phone', required: false }], actions: ['login', 'qr', 'code', 'password', 'sync', 'disconnect'] },
+  { channel: 'max_personal', enabled: maxEnabled, connection: { flow: 'qr', configured: maxEnabled, methods: maxMethods }, config_fields: [{ name: 'phone', required: false }, { name: 'login_method', required: false }, { name: 'history_days', required: false }], actions: ['login', 'qr', 'code', 'password', 'sync', 'disconnect'] },
   { channel: 'sms_gateway', enabled: false, config_fields: [], actions: [] },
 ];
 (async () => {
@@ -31,7 +32,7 @@ const caps = (configured = true) => [
       if (pathname === '/api/runtime') return reply({ local_test: true, demo: false });
       if (pathname === '/api/local/token') return reply({ access_token: 'mock-session' });
       if (pathname === '/api/me') return reply({ sub: 'local-owner', tenant_id: 'local-test', role: options.role || 'admin' });
-      if (pathname === '/api/capabilities') return reply(caps(data.configured));
+      if (pathname === '/api/capabilities') return reply(caps(data.configured, options.maxMethods, options.maxEnabled));
       if (pathname === '/api/integrations/telegram') { if (request.method() === 'PUT') { assert.match(body.api_hash, /^[a-f0-9]{32}$/); data.configured = true; } return reply({ channel: 'telegram', configured: data.configured }); }
       if (pathname === '/api/accounts' && request.method() === 'GET') return reply(data.accounts);
       if (pathname === '/api/accounts' && request.method() === 'POST') {
@@ -45,15 +46,17 @@ const caps = (configured = true) => [
         const id = 'job-' + data.actions.length;
         let error = null;
         if (body.action === 'login' && account.channel === 'telegram') { account.state = 'awaiting_code'; account.public = { phone: body.payload.phone || '+79991234567' }; }
+        else if (body.action === 'login' && account.channel === 'max_personal' && body.payload.login_method === 'sms') { account.state = 'code_required'; account.public = { phone: body.payload.phone, auth_method: 'sms', code_length: 6 }; }
         else if (body.action === 'login' || body.action === 'qr') {
           if (account.channel === 'whatsapp_web' && data.mode === 'connecting') { account.state = 'connecting'; account.public = { provider_state: 'STARTING' }; }
-          else { account.state = 'qr_required'; account.public = { qr_data_url: fixtureQR, auth_method: 'qr', ...(account.channel === 'telegram' ? { expires_at: new Date(Date.now() + 60000).toISOString() } : {}) }; }
+          else if (account.channel === 'max_personal' && data.mode === 'max_qr_error') { account.state = 'new'; account.public = { error: 'max_transport_error' }; error = 'max_transport_error'; }
+          else { account.state = 'qr_required'; account.public = { qr_data_url: fixtureQR, auth_method: 'qr', ...(account.channel === 'telegram' ? { expires_at: new Date(Date.now() + 60000).toISOString() } : account.channel === 'max_personal' ? { expires_at: Date.now() / 1000 + 60, polling_interval: 5 } : {}) }; }
         }
         else if (body.action === 'code') {
-          if (body.payload.code === '00000') error = 'telegram_code_invalid';
-          else { account.state = 'awaiting_password'; account.public = { phone: '+79991234567' }; }
+          if (/^0+$/.test(body.payload.code)) error = account.channel === 'max_personal' ? 'max_code_invalid' : 'telegram_code_invalid';
+          else { account.state = account.channel === 'max_personal' ? 'password_required' : 'awaiting_password'; account.public = { phone: '+79991234567', ...(account.channel === 'max_personal' ? { hint: '<b>Test hint</b>', auth_method: 'sms' } : {}) }; }
         } else if (body.action === 'password') {
-          if (body.payload.password === 'wrong') error = 'telegram_password_invalid';
+          if (body.payload.password === 'wrong') error = account.channel === 'max_personal' ? 'max_password_invalid' : 'telegram_password_invalid';
           else { account.state = 'connected'; account.public = { identity: { phone: '+79991234567', display_name: 'Тестовый менеджер' } }; }
         } else if (body.action === 'disconnect') { account.state = 'disconnected'; account.public = {}; }
         if (data.mode === 'tg_queued' && account.channel === 'telegram') {
@@ -215,6 +218,145 @@ const caps = (configured = true) => [
     assert.equal(await qr.dialog.getByLabel('Номер телефона *', { exact: true }).inputValue(), '+79990000000');
     checks.push('TG real QR action, provider expiry, mobile layout, switch QR to phone without stale refresh');
     await qr.page.close();
+
+    const maxQr = await fixture({ clock: true });
+    await maxQr.dialog.getByRole('button', { name: 'Подключить MAX', exact: true }).click();
+    await maxQr.dialog.getByRole('img', { name: 'QR-код подключения MAX' }).waitFor();
+    assert.deepEqual(maxQr.data.actions.map(action => action.action), ['qr']);
+    assert.deepEqual(maxQr.data.creates[0], { channel: 'max_personal', label: 'MAX', config: {} });
+    assert.equal(await maxQr.dialog.locator('input').count(), 0);
+    assert.equal(await maxQr.dialog.locator('.connection-steps li').count(), 4);
+    assert.equal(await maxQr.dialog.getByText(/Telegram|WhatsApp|API|history_days|login_method/).count(), 0);
+    for (let pending = 0; pending < 5; pending++) {
+      await maxQr.page.clock.fastForward(5000); await maxQr.refresh();
+      assert.equal(await maxQr.dialog.getByRole('button', { name: 'Перейти в чаты' }).count(), 0, 'Pending MAX QR must never claim success');
+    }
+    await maxQr.page.screenshot({ path: '/tmp/omnicrm-connection-max-qr.png' });
+    maxQr.data.accounts[0].state = 'connected'; maxQr.data.accounts[0].public = { identity: { id: 'max-test-user', phone: '+79990002233', display_name: 'MAX тест' } };
+    await maxQr.refresh();
+    await maxQr.dialog.getByText('Канал +79990002233 подключён', { exact: true }).waitFor();
+    await maxQr.dialog.getByRole('button', { name: 'Перейти в чаты' }).click();
+    assert.equal(await maxQr.page.getByRole('dialog').count(), 0);
+    assert.equal(maxQr.data.actions.length, 1, 'MAX status polling must not enqueue duplicate auth requests');
+    checks.push('MAX QR-first, no technical fields, repeated pending stays pending, verified identity success and chats');
+    await maxQr.page.close();
+
+    const maxExpiry = await fixture({ mobile: true });
+    await maxExpiry.dialog.getByRole('button', { name: 'Подключить MAX', exact: true }).click();
+    await maxExpiry.dialog.getByRole('img', { name: 'QR-код подключения MAX' }).waitFor();
+    await maxExpiry.dialog.getByText(/Код действует ещё \d+ с/, { exact: true }).waitFor();
+    assert.equal(await maxExpiry.page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+    await maxExpiry.page.screenshot({ path: '/tmp/omnicrm-connection-max-mobile.png' });
+    maxExpiry.data.accounts[0].public.expires_at = Date.now() / 1000 - 1;
+    await maxExpiry.refresh();
+    assert.equal(await maxExpiry.dialog.getByRole('img').count(), 0, 'MAX Unix-second QR expiry must hide the expired credential');
+    await maxExpiry.dialog.getByText('QR-код устарел', { exact: true }).waitFor();
+    assert.equal(await maxExpiry.dialog.getByText('Обновляем QR-код…', { exact: true }).count(), 0);
+    maxExpiry.data.accounts[0].state = 'login_required'; maxExpiry.data.accounts[0].public = { reason: 'qr_expired', auth_method: 'qr' };
+    await maxExpiry.refresh();
+    await maxExpiry.dialog.getByRole('heading', { name: 'QR-код MAX устарел' }).waitFor();
+    await maxExpiry.dialog.getByRole('button', { name: 'Получить новый QR-код' }).click();
+    await maxExpiry.dialog.getByRole('img', { name: 'QR-код подключения MAX' }).waitFor();
+    assert.equal(maxExpiry.data.creates.length, 1);
+    assert.deepEqual(maxExpiry.data.actions.map(action => action.action), ['qr', 'qr']);
+    checks.push('MAX mobile layout, seconds-based expiry, explicit QR renewal reuses account');
+    await maxExpiry.page.close();
+
+    const maxPhone = await fixture();
+    await maxPhone.dialog.getByRole('button', { name: 'Подключить MAX', exact: true }).click();
+    await maxPhone.dialog.getByRole('img', { name: 'QR-код подключения MAX' }).waitFor();
+    await maxPhone.dialog.getByRole('button', { name: 'Войти по номеру телефона' }).click();
+    await maxPhone.dialog.getByLabel('Номер телефона *', { exact: true }).fill('+7 (999) 123-45-67');
+    await maxPhone.refresh();
+    assert.equal(await maxPhone.dialog.getByLabel('Номер телефона *', { exact: true }).inputValue(), '+7 (999) 123-45-67');
+    await maxPhone.dialog.getByRole('button', { name: 'Получить код', exact: true }).dblclick();
+    await maxPhone.dialog.getByLabel('Код из сообщения *').fill('000000');
+    assert.equal(maxPhone.data.creates.length, 1);
+    assert.deepEqual(maxPhone.data.actions[1].payload, { phone: '+79991234567', login_method: 'sms' });
+    await maxPhone.dialog.getByRole('button', { name: 'Подключить', exact: true }).click();
+    await maxPhone.dialog.getByRole('alert').getByText(/Код не подошёл/).waitFor();
+    await maxPhone.dialog.getByLabel('Код из сообщения *').fill('123456');
+    await maxPhone.dialog.getByRole('button', { name: 'Подключить', exact: true }).click();
+    await maxPhone.dialog.getByText('Подсказка: <b>Test hint</b>', { exact: true }).waitFor();
+    assert.equal(await maxPhone.dialog.locator('b').count(), 0, 'Provider hint is text, never markup');
+    await maxPhone.dialog.getByLabel('Пароль двухэтапной проверки *').fill('wrong');
+    await maxPhone.dialog.getByRole('button', { name: 'Подтвердить пароль' }).click();
+    await maxPhone.dialog.getByRole('alert').getByText(/Неверный пароль MAX/).waitFor();
+    await maxPhone.dialog.getByLabel('Пароль двухэтапной проверки *').fill('test-password');
+    await maxPhone.dialog.getByRole('button', { name: 'Подтвердить пароль' }).click();
+    await maxPhone.dialog.getByText('Канал +79991234567 подключён', { exact: true }).waitFor();
+    assert.equal(await maxPhone.dialog.locator('input').count(), 0);
+    assert.deepEqual(await maxPhone.page.evaluate(() => ({ local: localStorage.length, session: sessionStorage.length })), { local: 0, session: 0 });
+    checks.push('MAX QR to phone survives refresh, sms login payload, code/password retry, safe hint, no browser credential storage');
+    await maxPhone.page.close();
+
+    const maxPassword = await fixture();
+    await maxPassword.dialog.getByRole('button', { name: 'Подключить MAX', exact: true }).click();
+    await maxPassword.dialog.getByRole('img', { name: 'QR-код подключения MAX' }).waitFor();
+    maxPassword.data.accounts[0].state = 'password_required'; maxPassword.data.accounts[0].public = { auth_method: 'qr', hint: 'Тестовая подсказка' };
+    await maxPassword.refresh();
+    await maxPassword.dialog.getByLabel('Пароль двухэтапной проверки *').fill('test-password');
+    assert.equal(await maxPassword.dialog.getByLabel('Номер телефона *', { exact: true }).count(), 0);
+    assert.equal(await maxPassword.dialog.getByLabel('Код из сообщения *').count(), 0);
+    await maxPassword.dialog.getByRole('button', { name: 'Подтвердить пароль' }).click();
+    await maxPassword.dialog.getByRole('button', { name: 'Перейти в чаты' }).waitFor();
+    checks.push('MAX QR can transition directly to two-factor password');
+    await maxPassword.page.close();
+
+    const maxRetry = await fixture({ mode: 'max_qr_error' });
+    await maxRetry.dialog.getByRole('button', { name: 'Подключить MAX', exact: true }).click();
+    await maxRetry.dialog.getByRole('alert').getByText(/Сервер не смог установить связь с MAX/).waitFor();
+    assert.equal(await maxRetry.dialog.locator('.connection-spinner').count(), 0);
+    maxRetry.data.mode = null;
+    await maxRetry.dialog.getByRole('button', { name: 'Повторить подключение', exact: true }).click();
+    await maxRetry.dialog.getByRole('img', { name: 'QR-код подключения MAX' }).waitFor();
+    assert.equal(maxRetry.data.creates.length, 1);
+    maxRetry.data.accounts[0].state = 'reauth_required'; maxRetry.data.accounts[0].public = { error: 'max_account_identity_changed' };
+    await maxRetry.refresh();
+    await maxRetry.dialog.getByRole('alert').getByText(/Для нового аккаунта добавьте отдельный канал/).waitFor();
+    assert.equal(await maxRetry.dialog.getByRole('button', { name: 'Перейти в чаты' }).count(), 0);
+    assert.equal(await maxRetry.dialog.getByRole('button', { name: 'Подключить снова' }).count(), 0, 'A mismatched session must be revoked before retry');
+    await maxRetry.dialog.getByRole('button', { name: 'Отключить аккаунт', exact: true }).click();
+    await maxRetry.dialog.getByText(/История канала и привязка к прежнему аккаунту сохранятся/).waitFor();
+    assert.equal(maxRetry.data.actions.length, 2, 'Disconnect requires its explicit confirmation');
+    await maxRetry.dialog.getByRole('button', { name: 'Отключить', exact: true }).click();
+    await maxRetry.dialog.getByRole('heading', { name: 'Аккаунт отключён' }).waitFor();
+    assert.equal(maxRetry.data.actions[2].action, 'disconnect');
+    await maxRetry.dialog.getByRole('button', { name: 'Подключить снова', exact: true }).click();
+    await maxRetry.dialog.getByRole('img', { name: 'QR-код подключения MAX' }).waitFor();
+    assert.equal(maxRetry.data.creates.length, 1, 'Revocation and re-login preserve the existing corporate account');
+    checks.push('MAX transport retry, identity mismatch requires confirmed revoke, re-login keeps account/history');
+    await maxRetry.page.close();
+
+    const maxQrOnly = await fixture({ maxMethods: ['qr'] });
+    await maxQrOnly.dialog.getByRole('button', { name: 'Подключить MAX', exact: true }).click();
+    await maxQrOnly.dialog.getByRole('img', { name: 'QR-код подключения MAX' }).waitFor();
+    assert.equal(await maxQrOnly.dialog.getByRole('button', { name: 'Войти по номеру телефона' }).count(), 0);
+    await maxQrOnly.page.close();
+    const maxPhoneOnly = await fixture({ maxMethods: ['phone_code'] });
+    await maxPhoneOnly.dialog.getByRole('button', { name: 'Подключить MAX', exact: true }).click();
+    await maxPhoneOnly.dialog.getByLabel('Номер телефона *', { exact: true }).waitFor();
+    assert.equal(await maxPhoneOnly.dialog.getByRole('button', { name: 'Подключить по QR-коду' }).count(), 0);
+    assert.equal(maxPhoneOnly.data.actions.length, 0);
+    await maxPhoneOnly.page.close();
+    const maxDisabled = await fixture({ maxEnabled: false });
+    await maxDisabled.dialog.getByRole('button', { name: 'Подключить MAX', exact: true }).click();
+    await maxDisabled.dialog.getByText('Администратор должен включить подключение MAX на сервере.', { exact: true }).waitFor();
+    assert.equal(maxDisabled.data.creates.length, 0);
+    assert.equal(await maxDisabled.dialog.locator('input').count(), 0);
+    checks.push('MAX method and availability capability gating without technical setup fields');
+    await maxDisabled.page.close();
+
+    const maxClose = await fixture({ mode: 'pending' });
+    await maxClose.dialog.getByRole('button', { name: 'Подключить MAX', exact: true }).click();
+    await maxClose.dialog.getByText('Мессенджер подтверждает подключение…').waitFor();
+    await maxClose.dialog.getByRole('button', { name: 'Закрыть окно' }).click();
+    const maxReads = maxClose.data.jobReads;
+    await maxClose.page.waitForTimeout(1700);
+    assert.equal(maxClose.data.jobReads, maxReads);
+    assert.equal(await maxClose.page.getByRole('dialog').count(), 0);
+    checks.push('MAX close cancels client job polling without reopening or new requests');
+    await maxClose.page.close();
 
     const close = await fixture({ mode: 'pending' });
     await close.dialog.getByRole('button', { name: 'Подключить WhatsApp', exact: true }).click();

@@ -231,8 +231,9 @@ input::placeholder, textarea::placeholder { color: #9a9fb1; }
 .connection-modal .field input { padding: 12px; font-size: 13px; min-height: 43px; }
 .connection-modal .field input:read-only { background: #f5f6fa; color: var(--muted); }
 .connection-modal .button { min-height: 40px; }
-.telegram-connection { width: 432px; }
-.telegram-connection:has(.qr-layout) { width: 660px; }
+.telegram-connection, .max-connection { width: 432px; }
+.telegram-connection:has(.qr-layout), .max-connection:has(.qr-layout) { width: 660px; }
+.connection-modal .channel-icon.max_personal { background: #6b4ee8; color: white; border-radius: 50%; font-weight: 750; }
 .connection-intro { font-size: 12px; line-height: 1.75; color: var(--muted); margin-bottom: 21px; }
 .connection-step { color: var(--brand); font-size: 11px; font-weight: 600; margin-bottom: 9px; }
 .connection-divider { display: flex; align-items: center; color: #9298aa; font-size: 11px; gap: 13px; margin: 17px 0; }

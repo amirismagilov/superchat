@@ -237,6 +237,13 @@ def create_account(body: AccountCreate, user=Depends(identity), db: Session = De
             config.update(unseal(integration.encrypted_config))
         if "phone" in config and (not isinstance(config["phone"], str) or not re.fullmatch(r"\+[1-9][0-9]{7,14}", config["phone"])):
             raise HTTPException(422, "telegram_phone_invalid")
+    if body.channel == "max_personal":
+        if config.get("login_method", "qr") not in ("qr", "sms"):
+            raise HTTPException(422, "max_login_method_invalid")
+        if "phone" in config and (not isinstance(config["phone"], str) or not re.fullmatch(r"\+[1-9][0-9]{6,14}", config["phone"])):
+            raise HTTPException(422, "max_phone_required")
+        if "history_days" in config and (type(config["history_days"]) is not int or not 1 <= config["history_days"] <= 3650):
+            raise HTTPException(422, "max_history_days_invalid")
     a = Account(tenant_id=user.tenant_id, owner_id=body.owner_id or user.sub, channel=body.channel,
                 label=body.label, encrypted_config=seal(config))
     db.add(a)
@@ -264,6 +271,15 @@ def action(account_id: str, body: Action, user=Depends(identity), db: Session = 
         raise HTTPException(422, "unsupported_action")
     if len(json.dumps(body.payload)) > 12000:
         raise HTTPException(422, "payload_too_large")
+    if a.channel == "max_personal":
+        allowed = {"login": {"phone", "login_method"}, "qr": set(), "code": {"code"},
+                   "password": {"password"}, "sync": set(), "disconnect": set()}[body.action]
+        if set(body.payload) - allowed:
+            raise HTTPException(422, "unsupported_auth_fields")
+        if "login_method" in body.payload and body.payload["login_method"] not in ("qr", "sms"):
+            raise HTTPException(422, "max_login_method_invalid")
+        if "phone" in body.payload and (not isinstance(body.payload["phone"], str) or not re.fullmatch(r"\+[1-9][0-9]{6,14}", body.payload["phone"])):
+            raise HTTPException(422, "max_phone_required")
     job = Job(account_id=a.id, action=body.action, encrypted_payload=seal(body.payload))
     db.add(job)
     db.flush()

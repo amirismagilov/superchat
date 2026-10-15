@@ -76,6 +76,24 @@ function connectionError(error) {
     worker_interrupted_retry_login: 'Во время подключения сервер перезапустился. Повторите вход.',
     telegram_account_identity_changed: 'В этом канале был другой аккаунт. Для нового номера добавьте отдельный канал.',
     whatsapp_account_identity_changed: 'В этом канале был другой аккаунт. Для нового номера добавьте отдельный канал.',
+    max_account_identity_changed: 'В этом канале был другой аккаунт MAX. Для нового аккаунта добавьте отдельный канал.',
+    max_phone_invalid: 'Введите номер в международном формате, например +79991234567.',
+    max_phone_required: 'Введите номер вашего рабочего аккаунта MAX в международном формате.',
+    max_code_invalid: 'Код не подошёл. Проверьте последний код входа в MAX и попробуйте ещё раз.',
+    invalid_max_code: 'Код не подошёл. Введите цифры из последнего кода входа в MAX.',
+    max_code_expired: 'Срок действия кода MAX истёк. Запросите новый код.',
+    max_password_invalid: 'Неверный пароль MAX. Проверьте пароль и попробуйте ещё раз.',
+    max_password_required: 'Введите пароль двухэтапной проверки MAX.',
+    max_qr_expired: 'QR-код MAX устарел. Получите новый код и подтвердите вход на телефоне.',
+    max_auth_action_out_of_sequence: 'Этот шаг входа в MAX больше не действует. Начните подключение ещё раз.',
+    max_transport_error: 'Сервер не смог установить связь с MAX. Повторите вход немного позже.',
+    max_auth_failed: 'MAX не подтвердил вход. Повторите подключение и подтвердите вход на телефоне.',
+    max_session_expired: 'Сеанс MAX завершён. Войдите в аккаунт ещё раз.',
+    max_restore_failed: 'Не удалось восстановить подключение MAX. Повторите вход.',
+    max_credentials_rejected_or_registration_required: 'MAX не подтвердил существующий аккаунт. Проверьте вход в приложении MAX на телефоне и повторите подключение.',
+    max_revoke_unconfirmed: 'MAX пока не подтвердил отключение аккаунта. Повторите попытку немного позже.',
+    max_own_profile_missing: 'MAX ещё не подтвердил профиль аккаунта. Подождите или повторите подключение.',
+    install_maxapi_python_2_4_1: 'Подключение MAX ещё не подготовлено на сервере. Обратитесь к администратору.',
     waha_transport_error: 'Нет связи со шлюзом WhatsApp. Повторите проверку через некоторое время.',
     waha_server_error: 'Шлюз WhatsApp временно недоступен. Повторите проверку через некоторое время.',
     waha_rate_limited: 'WhatsApp просит подождать перед следующей попыткой.',
@@ -488,19 +506,20 @@ export class OmniInbox extends HTMLElement {
   openConnect() {
     const content = this.openModal('Каналы связи', 'Подключите рабочий аккаунт и общайтесь с клиентами от своего имени.');
     this._modal.querySelector('.modal').classList.add('channels-modal');
-    const connected = this._accounts.filter(account => ['telegram', 'whatsapp_web'].includes(account.channel));
+    const connected = this._accounts.filter(account => ['telegram', 'whatsapp_web', 'max_personal'].includes(account.channel));
     if (connected.length) {
       content.append(el('h3', { class: 'channels-section-title' }, 'Ваши подключения'), el('div', { class: 'connected-channels' }, connected.map(account => el('button', { type: 'button', class: 'connected-channel', onclick: () => this.openManageAccount(account) }, [channelIcon(account.channel), el('div', { class: 'connected-channel-copy' }, [el('strong', {}, account.public?.identity?.phone || account.label), el('span', {}, CHANNEL_LABELS[account.channel])]), el('span', { class: `channel-state ${stateColor(account.state)}` }, [el('span', { class: `status-dot ${stateColor(account.state)}` }), stateLabel(account.state)])]))));
     }
     content.append(el('h3', { class: 'channels-section-title' }, connected.length ? 'Подключить ещё' : 'Выберите мессенджер'));
     const grid = el('div', { class: 'provider-grid connection-grid' });
     const order = ['whatsapp_web', 'telegram', 'max_personal', 'whatsapp_cloud', 'max_bot', 'sms_gateway', 'demo'];
-    const descriptions = { whatsapp_web: 'Ваш номер · вход по QR-коду', telegram: 'Ваш аккаунт · номер телефона или QR', max_personal: 'Ваш аккаунт MAX', whatsapp_cloud: 'Бизнес-номер компании', max_bot: 'Сообщения от бота', sms_gateway: 'Сообщения с рабочей SIM', demo: 'Проверка без реальных сообщений' };
+    const descriptions = { whatsapp_web: 'Ваш номер · вход по QR-коду', telegram: 'Ваш аккаунт · номер телефона или QR', max_personal: 'Ваш аккаунт · QR-код или номер телефона', whatsapp_cloud: 'Бизнес-номер компании', max_bot: 'Сообщения от бота', sms_gateway: 'Сообщения с рабочей SIM', demo: 'Проверка без реальных сообщений' };
     for (const capability of [...this._capabilities].sort((a, b) => order.indexOf(a.channel) - order.indexOf(b.channel))) {
       if (capability.channel === 'demo' && !capability.enabled) continue;
-      const guided = ['telegram', 'whatsapp_web'].includes(capability.channel);
+      const guided = ['telegram', 'whatsapp_web', 'max_personal'].includes(capability.channel);
       const configured = capability.enabled && capability.connection?.configured !== false;
-      const description = capability.channel === 'telegram' && !capability.connection?.methods?.includes('qr') ? 'Ваш аккаунт · номер телефона и код' : descriptions[capability.channel];
+      const methods = capability.connection?.methods || [];
+      const description = ['telegram', 'max_personal'].includes(capability.channel) && !methods.includes('qr') ? 'Ваш аккаунт · номер телефона и код' : capability.channel === 'max_personal' && !methods.some(method => ['phone', 'phone_code'].includes(method)) ? 'Ваш аккаунт · вход по QR-коду' : descriptions[capability.channel];
       grid.append(el('button', { type: 'button', class: `provider-option channel-tile${configured ? '' : ' needs-setup'}`, onclick: () => guided ? this.openGuidedConnection(capability.channel) : this.openAdvancedConnection(capability), 'aria-label': `Подключить ${CHANNEL_LABELS[capability.channel] || capability.label}` }, [channelIcon(capability.channel), el('span', { class: 'provider-name' }, CHANNEL_LABELS[capability.channel] || capability.label), el('span', { class: 'channel-description' }, description), el('span', { class: `channel-tile-action${configured ? '' : ' muted'}` }, configured ? 'Подключить' : 'Требуется настройка')]));
     }
     content.append(grid, el('p', { class: 'connection-footer' }, [icon('lock', 14), 'Доступ к каналам и истории определяется вашей учётной записью CRM.']));
@@ -556,21 +575,25 @@ export class OmniInbox extends HTMLElement {
     this._modalCleanup = () => { apiId.input.value = ''; apiHash.input.value = ''; };
   }
   openGuidedConnection(channel, originalAccount = null, autoLogin = false) {
-    const telegram = channel === 'telegram';
+    const telegram = channel === 'telegram', max = channel === 'max_personal', whatsapp = channel === 'whatsapp_web';
+    const channelName = CHANNEL_LABELS[channel];
     const capability = this.capability(channel);
-    const content = this.openModal(`Подключение ${CHANNEL_LABELS[channel]}`);
+    const supportsQr = capability?.connection?.methods?.includes('qr');
+    const supportsPhone = telegram || capability?.connection?.methods?.some(method => ['phone', 'phone_code'].includes(method));
+    const phoneFirst = telegram || (max && !supportsQr && supportsPhone);
+    const content = this.openModal(`Подключение ${channelName}`);
     const modal = this._modal, generation = this._generation;
     const alive = () => modal === this._modal && generation === this._generation && this.isConnected;
-    modal.querySelector('.modal').classList.add('connection-modal', telegram ? 'telegram-connection' : 'whatsapp-connection');
+    modal.querySelector('.modal').classList.add('connection-modal', telegram ? 'telegram-connection' : max ? 'max-connection' : 'whatsapp-connection');
     modal.querySelector('.modal-header').prepend(channelIcon(channel));
     const unavailable = !capability?.enabled || capability.connection?.configured === false;
     if (unavailable && !originalAccount) {
-      content.append(el('div', { class: 'connection-unavailable' }, [el('div', { class: 'setup-illustration' }, icon('settings', 30)), el('h3', {}, 'Нужна настройка подключения'), el('p', {}, telegram ? 'Администратор должен один раз настроить Telegram для команды. После этого вы сможете войти по номеру телефона или QR-коду.' : 'Администратор должен включить подключение WhatsApp на сервере.'), el('div', { class: 'form-actions' }, [button('Все каналы', () => this.openConnect()), telegram && this._identity.role === 'admin' ? button('Настроить Telegram', () => this.openTelegramSettings(), 'primary') : null])]));
+      content.append(el('div', { class: 'connection-unavailable' }, [el('div', { class: 'setup-illustration' }, icon('settings', 30)), el('h3', {}, 'Нужна настройка подключения'), el('p', {}, telegram ? 'Администратор должен один раз настроить Telegram для команды. После этого вы сможете войти по номеру телефона или QR-коду.' : `Администратор должен включить подключение ${channelName} на сервере.`), el('div', { class: 'form-actions' }, [button('Все каналы', () => this.openConnect()), telegram && this._identity.role === 'admin' ? button('Настроить Telegram', () => this.openTelegramSettings(), 'primary') : null])]));
       return;
     }
-    let account = originalAccount, phase = telegram ? 'phone' : 'qr', busy = false, lastSignature = '', inputPhone = originalAccount?.public?.phone || '', authMethod = originalAccount?.public?.auth_method || (telegram ? 'phone' : 'qr');
-    let showSuccess = false, lastError = '', lastErrorSource = '', disconnected = false, uncertainty = false, phoneEntry = telegram && !originalAccount;
-    let waQrWaitStartedAt = telegram ? null : Date.now(), waQrTimedOut = false;
+    let account = originalAccount, phase = phoneFirst ? 'phone' : 'qr', busy = false, lastSignature = '', inputPhone = originalAccount?.public?.phone || '', authMethod = originalAccount?.public?.auth_method || (phoneFirst ? 'phone' : 'qr');
+    let showSuccess = false, lastError = '', lastErrorSource = '', disconnected = false, uncertainty = false, phoneEntry = phoneFirst && !originalAccount;
+    let waQrWaitStartedAt = whatsapp ? Date.now() : null, waQrTimedOut = false;
     const waWaitMessage = 'Сервер не вернул QR-код за 2 минуты. Повторите подключение. Если ожидание повторится, попросите администратора проверить связь сервера с WhatsApp.';
     const stage = el('div', { class: 'connection-stage' });
     const error = this.formError();
@@ -599,7 +622,8 @@ export class OmniInbox extends HTMLElement {
     const qrDetails = () => {
       const info = account?.public || {};
       const qr = info.qr_data_url;
-      const expiry = date(info.expires_at);
+      const expiryValue = typeof info.expires_at === 'number' && info.expires_at < 1e12 ? info.expires_at * 1000 : info.expires_at;
+      const expiry = date(expiryValue);
       return { image: typeof qr === 'string' && /^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=\r\n]+$/.test(qr) ? qr : '', expiry, expired: !!expiry && expiry.getTime() <= Date.now() };
     };
     const currentPhase = () => {
@@ -608,13 +632,13 @@ export class OmniInbox extends HTMLElement {
       if (['awaiting_password', 'password_required', 'need_password'].includes(account?.state)) return 'password';
       if (['awaiting_code', 'code_required', 'need_code'].includes(account?.state)) return 'code';
       if (['qr_required', 'awaiting_qr', 'connecting', 'starting'].includes(account?.state)) return 'qr';
-      if (['action_required', 'reauth_required', 'failed', 'error'].includes(account?.state)) return 'restart';
+      if (['action_required', 'reauth_required', 'login_required', 'failed', 'error'].includes(account?.state)) return 'restart';
       if (account?.state === 'disconnected') return 'restart';
-      return telegram && authMethod !== 'qr' ? 'phone' : 'qr';
+      return supportsPhone && authMethod !== 'qr' ? 'phone' : 'qr';
     };
     const showError = (value, source = 'action') => { lastError = value?.message || String(value || ''); lastErrorSource = lastError ? source : ''; error.textContent = connectionError(value); error.hidden = !lastError; };
     const updateWhatsAppWait = () => {
-      if (telegram) return;
+      if (!whatsapp) return;
       // A client deadline describes missing progress, never provider failure or login success.
       // Repeated account refreshes do not reset it; a real QR or explicit retry does.
       if (currentPhase() !== 'qr' || qrDetails().image) { waQrWaitStartedAt = null; waQrTimedOut = false; return; }
@@ -635,12 +659,12 @@ export class OmniInbox extends HTMLElement {
     };
     const createAccount = async config => {
       if (account) return;
-      const created = await this.post('/api/accounts', { channel, label: telegram && config.phone ? `Telegram · ${config.phone}` : CHANNEL_LABELS[channel], config });
+      const created = await this.post('/api/accounts', { channel, label: config.phone ? `${channelName} · ${config.phone}` : channelName, config });
       if (alive()) rememberAccount(created);
     };
     const runAction = async (action, payload = {}, config = {}) => {
       if (busy || !alive()) return;
-      if (!telegram && action === 'login' && !this._connectionJobs.has(account?.id)) { waQrWaitStartedAt = Date.now(); waQrTimedOut = false; }
+      if (whatsapp && action === 'login' && !this._connectionJobs.has(account?.id)) { waQrWaitStartedAt = Date.now(); waQrTimedOut = false; }
       setBusy(true); showError(''); recovery.replaceChildren();
       jobStatus.textContent = action === 'disconnect' ? 'Отключаем аккаунт…' : 'Подключаемся…';
       let knownJob = null;
@@ -698,7 +722,8 @@ export class OmniInbox extends HTMLElement {
       const next = currentPhase();
       const qr = qrDetails();
       updateWhatsAppWait();
-      const waQrBlocked = !telegram && !qr.image && (waQrTimedOut || !!account?.public?.error);
+      const waQrBlocked = whatsapp && !qr.image && (waQrTimedOut || !!account?.public?.error);
+      const qrBlocked = waQrBlocked || (max && !qr.image && !!account?.public?.error);
       const signature = JSON.stringify([account?.state, account?.public, qr.expired, next, disconnected, waQrTimedOut]);
       if (!force && signature === lastSignature) return;
       lastSignature = signature;
@@ -716,43 +741,55 @@ export class OmniInbox extends HTMLElement {
       if (phase === 'phone') {
         const phone = this.field('phone', 'Номер телефона', 'tel', true, '+7 999 123-45-67');
         phone.input.value = inputPhone; phone.input.autocomplete = 'tel';
-        phone.node.append(el('span', { class: 'field-help' }, 'Укажите номер вашего рабочего аккаунта Telegram.'));
+        phone.node.append(el('span', { class: 'field-help' }, `Укажите номер вашего рабочего аккаунта ${channelName}.`));
         const submit = el('button', { type: 'submit', class: 'button primary full' }, 'Получить код');
-        stage.append(el('p', { class: 'connection-intro' }, 'Войдите в Telegram, чтобы переписываться с клиентами из CRM.'), el('form', { onsubmit: event => {
+        stage.append(el('p', { class: 'connection-intro' }, `Войдите в ${channelName}, чтобы переписываться с клиентами из CRM.`), el('form', { onsubmit: event => {
           event.preventDefault(); if (busy) return;
           const value = phone.input.value.replace(/[\s()\-]/g, '');
-          if (!/^\+[1-9][0-9]{7,14}$/.test(value)) { showError(new Error('telegram_phone_invalid')); phone.input.focus(); return; }
-          inputPhone = value; authMethod = 'phone'; runAction('login', { phone: value }, { phone: value });
+          if (!/^\+[1-9][0-9]{7,14}$/.test(value)) { showError(new Error(max ? 'max_phone_invalid' : 'telegram_phone_invalid')); phone.input.focus(); return; }
+          inputPhone = value; authMethod = 'phone'; runAction('login', { phone: value, ...(max ? { login_method: 'sms' } : {}) }, { phone: value });
         } }, [phone.node, submit]));
-        if (capability.connection?.methods?.includes('qr')) stage.append(el('div', { class: 'connection-divider' }, 'или'), button('Подключить по QR-коду', () => { authMethod = 'qr'; phoneEntry = false; runAction('qr'); }, 'full'));
+        if (supportsQr) stage.append(el('div', { class: 'connection-divider' }, 'или'), button('Подключить по QR-коду', () => { authMethod = 'qr'; phoneEntry = false; runAction('qr'); }, 'full'));
       } else if (phase === 'code' || phase === 'password') {
         const password = phase === 'password';
-        const field = this.field(password ? 'password' : 'code', password ? 'Пароль двухэтапной проверки' : 'Код из сообщения', password ? 'password' : 'text', true, password ? 'Ваш пароль Telegram' : 'Введите код');
+        const field = this.field(password ? 'password' : 'code', password ? 'Пароль двухэтапной проверки' : 'Код из сообщения', password ? 'password' : 'text', true, password ? `Ваш пароль ${channelName}` : 'Введите код');
         if (!password) { field.input.inputMode = 'numeric'; field.input.autocomplete = 'one-time-code'; field.input.pattern = '[0-9 ]{4,12}'; field.input.maxLength = 12; }
-        const phone = this.field('connected-phone', 'Номер телефона', 'tel'); phone.input.value = inputPhone || 'Ваш аккаунт Telegram'; phone.input.readOnly = true;
+        const phone = this.field('connected-phone', 'Номер телефона', 'tel'); phone.input.value = inputPhone || `Ваш аккаунт ${channelName}`; phone.input.readOnly = true;
         const submit = el('button', { type: 'submit', class: 'button primary full' }, password ? 'Подтвердить пароль' : 'Подключить');
-        stage.append(el('div', { class: 'connection-step' }, password ? 'Последний шаг · защита аккаунта' : 'Подтвердите вход'), el('p', { class: 'connection-intro' }, password ? 'Для вашего аккаунта включена двухэтапная проверка. Введите облачный пароль Telegram.' : 'Откройте Telegram и найдите сообщение с кодом входа. Способ доставки кода определяет Telegram.'), el('form', { onsubmit: event => {
+        stage.append(el('div', { class: 'connection-step' }, password ? 'Последний шаг · защита аккаунта' : 'Подтвердите вход'), el('p', { class: 'connection-intro' }, password ? `Для вашего аккаунта включена двухэтапная проверка. Введите пароль ${channelName}.` : max ? 'Введите код входа, полученный для вашего аккаунта MAX.' : 'Откройте Telegram и найдите сообщение с кодом входа. Способ доставки кода определяет Telegram.'), el('form', { onsubmit: event => {
           event.preventDefault(); if (busy) return; const action = password ? 'password' : 'code'; const value = password ? field.input.value : field.input.value.replace(/\s/g, ''); field.input.value = ''; runAction(action, { [action]: value });
         } }, [...(!password && inputPhone ? [phone.node] : []), field.node, submit]));
-        if (!password) stage.append(button('Запросить новый код', () => runAction('login', inputPhone ? { phone: inputPhone } : {}), 'subtle full'));
-        else stage.append(el('p', { class: 'field-help connection-help' }, 'Это пароль Telegram, а не пароль компьютера или сервера.'));
+        if (!password) stage.append(button('Запросить новый код', () => runAction('login', { ...(inputPhone ? { phone: inputPhone } : {}), ...(max ? { login_method: 'sms' } : {}) }), 'subtle full'));
+        else {
+          if (max && typeof account?.public?.hint === 'string' && account.public.hint.trim()) stage.append(el('p', { class: 'field-help connection-help' }, `Подсказка: ${account.public.hint}`));
+          stage.append(el('p', { class: 'field-help connection-help' }, `Это пароль ${channelName}, а не пароль компьютера или сервера.`));
+        }
         queueMicrotask(() => { if (alive() && !busy) field.input.focus(); });
       } else if (phase === 'qr') {
-        const steps = telegram ? ['Откройте Telegram на телефоне.', 'Перейдите в «Настройки» → «Устройства».', 'Нажмите «Подключить устройство» и отсканируйте QR-код.', 'Дождитесь подтверждения подключения.'] : ['Откройте WhatsApp на телефоне.', 'Выберите «Настройки» → «Связанные устройства». На Android этот раздел находится в меню ⋮.', 'Нажмите «Привязка устройства» и отсканируйте QR-код.', 'Дождитесь подтверждения подключения.'];
+        const steps = telegram ? ['Откройте Telegram на телефоне.', 'Перейдите в «Настройки» → «Устройства».', 'Нажмите «Подключить устройство» и отсканируйте QR-код.', 'Дождитесь подтверждения подключения.'] : max ? ['Откройте MAX на телефоне с рабочим аккаунтом.', 'Отсканируйте QR-код камерой телефона.', 'Перейдите в MAX и подтвердите вход.', 'Дождитесь подтверждения подключения здесь.'] : ['Откройте WhatsApp на телефоне.', 'Выберите «Настройки» → «Связанные устройства». На Android этот раздел находится в меню ⋮.', 'Нажмите «Привязка устройства» и отсканируйте QR-код.', 'Дождитесь подтверждения подключения.'];
         const visual = el('div', { class: 'qr-visual' });
         if (qr.image && !qr.expired) visual.append(el('img', { class: 'connection-qr', src: qr.image, alt: `QR-код подключения ${CHANNEL_LABELS[channel]}`, referrerpolicy: 'no-referrer' }));
-        else visual.append(el('div', { class: 'qr-placeholder', role: 'status' }, [waQrBlocked ? icon('warning', 28) : qr.expired ? icon('refresh', 28) : el('span', { class: 'connection-spinner' }), el('span', {}, waQrBlocked ? 'QR-код пока не получен' : qr.expired ? 'Обновляем QR-код…' : 'Получаем QR-код…')]));
-        const qrStatus = el('p', { class: 'qr-status', role: 'status' }, waQrBlocked ? 'Повторите подключение или проверьте связь с сервером.' : qr.expired ? 'Предыдущий код больше не действует.' : qr.expiry ? '' : 'Подключение подтвердится автоматически.');
+        else visual.append(el('div', { class: 'qr-placeholder', role: 'status' }, [qrBlocked ? icon('warning', 28) : qr.expired ? icon('refresh', 28) : el('span', { class: 'connection-spinner' }), el('span', {}, qrBlocked ? 'QR-код пока не получен' : qr.expired ? max ? 'QR-код устарел' : 'Обновляем QR-код…' : 'Получаем QR-код…')]));
+        const qrStatus = el('p', { class: 'qr-status', role: 'status' }, qrBlocked ? 'Повторите подключение или проверьте связь с сервером.' : qr.expired ? max ? 'Получите новый QR-код для входа.' : 'Предыдущий код больше не действует.' : qr.expiry ? '' : 'Подключение подтвердится автоматически.');
         if (qr.expiry && !qr.expired) qrStatus.textContent = `Код действует ещё ${Math.max(0, Math.ceil((qr.expiry.getTime() - Date.now()) / 1000))} с`;
         visual.append(qrStatus);
-        stage.append(el('div', { class: 'qr-layout' }, [el('div', {}, [el('h3', { class: 'connection-subtitle' }, 'Свяжите ваш аккаунт с CRM'), el('ol', { class: 'connection-steps' }, steps.map(text => el('li', {}, text))), el('p', { class: 'connection-help' }, telegram ? 'При включённой двухэтапной проверке Telegram дополнительно запросит пароль.' : 'Клиенты увидят обычный чат с вашим рабочим номером.')]), visual]));
-        if (account) stage.append(el('div', { class: 'qr-actions' }, [button(waQrBlocked || ['new', 'created'].includes(account.state) ? 'Повторить подключение' : 'Обновить QR-код', () => runAction(telegram ? 'qr' : 'login'), '', 'refresh'), telegram ? button('Войти по номеру телефона', () => { authMethod = 'phone'; phoneEntry = true; showError(''); render(true); }, 'subtle') : null]));
-        if (!telegram) stage.append(el('p', { class: 'connection-caution' }, 'Подключение через связанные устройства использует неофициальную интеграцию. WhatsApp может ограничить её работу.'));
+        stage.append(el('div', { class: 'qr-layout' }, [el('div', {}, [el('h3', { class: 'connection-subtitle' }, 'Свяжите ваш аккаунт с CRM'), el('ol', { class: 'connection-steps' }, steps.map(text => el('li', {}, text))), el('p', { class: 'connection-help' }, telegram || max ? `При включённой двухэтапной проверке ${channelName} дополнительно запросит пароль.` : 'Клиенты увидят обычный чат с вашим рабочим номером.')]), visual]));
+        if (account) stage.append(el('div', { class: 'qr-actions' }, [button(qrBlocked || ['new', 'created'].includes(account.state) ? 'Повторить подключение' : 'Обновить QR-код', () => runAction(whatsapp ? 'login' : 'qr'), '', 'refresh'), supportsPhone ? button('Войти по номеру телефона', () => { authMethod = 'phone'; phoneEntry = true; showError(''); render(true); }, 'subtle') : null]));
+        if (whatsapp) stage.append(el('p', { class: 'connection-caution' }, 'Подключение через связанные устройства использует неофициальную интеграцию. WhatsApp может ограничить её работу.'));
       } else {
-        const lateWhatsApp = !telegram && !disconnected && account?.state === 'action_required' && account.public?.error === 'waha_connect_timeout';
-        stage.append(el('div', { class: 'connection-unavailable' }, [el('div', { class: 'setup-illustration' }, icon(disconnected ? 'check' : 'refresh', 28)), el('h3', {}, disconnected ? 'Аккаунт отключён' : lateWhatsApp ? 'Подтверждение подключения задерживается' : 'Нужно повторить подключение'), el('p', {}, disconnected ? 'История переписки сохранена в CRM.' : lateWhatsApp ? 'Если WhatsApp завершит вход, статус обновится автоматически.' : 'Откройте приложение на телефоне и начните вход ещё раз.'), button('Подключить снова', () => { disconnected = false; if (telegram) { authMethod = 'phone'; phoneEntry = true; showError(''); render(true); } else runAction('login'); }, 'primary')]));
+        const lateWhatsApp = whatsapp && !disconnected && account?.state === 'action_required' && account.public?.error === 'waha_connect_timeout';
+        const maxQrExpired = max && (account?.public?.reason === 'qr_expired' || account?.public?.error === 'max_qr_expired');
+        stage.append(el('div', { class: 'connection-unavailable' }, [el('div', { class: 'setup-illustration' }, icon(disconnected ? 'check' : 'refresh', 28)), el('h3', {}, disconnected ? 'Аккаунт отключён' : maxQrExpired ? 'QR-код MAX устарел' : lateWhatsApp ? 'Подтверждение подключения задерживается' : 'Нужно повторить подключение'), el('p', {}, disconnected ? 'История переписки сохранена в CRM.' : maxQrExpired ? 'Получите новый QR-код и подтвердите вход в MAX на телефоне.' : lateWhatsApp ? 'Если WhatsApp завершит вход, статус обновится автоматически.' : 'Откройте приложение на телефоне и начните вход ещё раз.'), button(maxQrExpired ? 'Получить новый QR-код' : 'Подключить снова', () => { disconnected = false; if (telegram) { authMethod = 'phone'; phoneEntry = true; showError(''); render(true); } else if (max && supportsQr) { authMethod = 'qr'; phoneEntry = false; runAction('qr'); } else if (max && supportsPhone) { authMethod = 'phone'; phoneEntry = true; showError(''); render(true); } else runAction('login'); }, 'primary')]));
+        if (max && account?.public?.error === 'max_account_identity_changed') {
+          // The backend preserves the original identity binding. A mismatched
+          // session must be explicitly revoked before this channel can reconnect.
+          stage.querySelector('.connection-unavailable > .button')?.remove();
+          const revoke = el('div', { class: 'connection-management' });
+          revoke.append(button('Отключить аккаунт', () => revoke.replaceChildren(el('p', { class: 'field-help' }, 'Сеанс MAX будет отозван. История канала и привязка к прежнему аккаунту сохранятся.'), el('div', { class: 'form-actions' }, [button('Отмена', () => render(true)), button('Отключить', () => runAction('disconnect'), 'danger')])), 'danger full'));
+          stage.append(revoke);
+        }
       }
-      if (!telegram) {
+      if (whatsapp || max) {
         if (account?.public?.error) showError(new Error(account.public.error), 'provider');
         else if (waQrTimedOut && phase === 'qr') showError(waWaitMessage, 'watchdog');
         else if (['provider', 'watchdog'].includes(lastErrorSource)) showError('');
@@ -766,7 +803,7 @@ export class OmniInbox extends HTMLElement {
       if (latest) account = latest;
       // Older workers can report a transport error while the auth job is still
       // queued. Show it without dropping the known job or submitting a duplicate.
-      if (busy && telegram) {
+      if (busy && (telegram || max)) {
         if (account.public?.error) showError(new Error(account.public.error), 'provider');
         else if (lastErrorSource === 'provider') showError('');
       }
@@ -774,7 +811,7 @@ export class OmniInbox extends HTMLElement {
     };
     const expiryTimer = setInterval(() => {
       if (!alive() || busy || phase !== 'qr') return;
-      if (!telegram) { render(); return; }
+      if (whatsapp) { render(); return; }
       const qr = qrDetails();
       if (qr.expired) render();
       else if (qr.expiry) { const node = stage.querySelector('.qr-status'); if (node) node.textContent = `Код действует ещё ${Math.max(0, Math.ceil((qr.expiry.getTime() - Date.now()) / 1000))} с`; }
@@ -782,10 +819,11 @@ export class OmniInbox extends HTMLElement {
     this._modalCleanup = () => { clearInterval(expiryTimer); for (const input of content.querySelectorAll('input')) input.value = ''; };
     render(true);
     if (account && this._connectionJobs.has(account.id)) runAction(this._connectionJobs.get(account.id).action);
-    else if ((!originalAccount && !telegram) || autoLogin) runAction('login');
+    else if ((!originalAccount && whatsapp) || autoLogin) runAction(max && supportsQr ? 'qr' : 'login');
+    else if (!originalAccount && max && supportsQr) runAction('qr');
   }
   openManageAccount(originalAccount, autoLogin = false) {
-    if (['telegram', 'whatsapp_web'].includes(originalAccount.channel)) { this.openGuidedConnection(originalAccount.channel, originalAccount, autoLogin); return; }
+    if (['telegram', 'whatsapp_web', 'max_personal'].includes(originalAccount.channel)) { this.openGuidedConnection(originalAccount.channel, originalAccount, autoLogin); return; }
     const content = this.openModal(originalAccount.label, `${CHANNEL_LABELS[originalAccount.channel] || originalAccount.channel} · управление подключением`);
     const modal = this._modal;
     const capability = this.capability(originalAccount.channel);

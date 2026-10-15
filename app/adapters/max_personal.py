@@ -29,6 +29,40 @@ class _PendingAuth(Exception):
         self.result = result
 
 
+def _auth_error(exc: Exception, action: str) -> ProviderError:
+    """Never expose SDK exceptions: they can contain a provider payload."""
+    from pymax.exceptions import ApiError
+    from pymax.protocol import Opcode
+    if isinstance(exc, ProviderError):
+        return exc
+    if isinstance(exc, (ConnectionError, OSError, EOFError, TimeoutError)):
+        return ProviderError("max_transport_error")
+    if isinstance(exc, ApiError):
+        if exc.opcode == Opcode.LOGIN and any(
+                value in {"FAIL_LOGIN_TOKEN", "FAIL_LOGOUT_ALL"} for value in (exc.error, exc.message)):
+            return ProviderError("max_session_expired")
+        if action in {"code", "password"}:
+            return ProviderError("max_code_invalid" if action == "code" else "max_password_invalid")
+    return ProviderError("max_auth_failed")
+
+
+def _pending_public(config: dict) -> AuthResult:
+    pending = config.get("_max_pending", {})
+    method = config.get("login_method", "qr")
+    public = {"experimental": True, "auth_method": method}
+    if method == "sms":
+        public["phone"] = config.get("phone", "")
+    if pending.get("kind") == "qr":
+        public.update(qr_data_url=_qr_data_url(pending["qr_text"]),
+                      expires_at=pending["expires_at"] / 1000,
+                      polling_interval=pending.get("polling_interval", 5000) / 1000)
+    elif pending.get("kind") == "code":
+        public["code_length"] = pending.get("code_length", 6)
+    elif pending.get("kind") == "password" and pending.get("hint"):
+        public["hint"] = pending["hint"]
+    return AuthResult(pending.get("kind", "login") + "_required", public)
+
+
 class _ConfigSessionStore:
     """Duck-typed PyMax StoreProtocol; the caller encrypts the config at commit."""
     def __init__(self, config):
@@ -79,22 +113,23 @@ class _SteppedAuthFlow:
         if self.action == "login":
             if self.config.get("login_method", "qr") == "sms":
                 phone = self.config.get("phone", "")
-                if not phone.startswith("+") or not phone[1:].isdigit():
+                if not re.fullmatch(r"\+[1-9][0-9]{6,14}", phone):
                     raise ProviderError("max_phone_required")
                 response = await api.request_code(phone)
-                self.config["_max_pending"] = {"kind": "code", "token": response.token}
-                raise _PendingAuth(AuthResult("code_required", {"code_length": response.code_length, "experimental": True}))
+                self.config["_max_pending"] = {"kind": "code", "token": response.token,
+                                               "code_length": response.code_length}
+                raise _PendingAuth(_pending_public(self.config))
             response = await api.request_qr()
             self.config["_max_pending"] = {
                 "kind": "qr", "track_id": response.track_id,
                 "qr_text": response.qr_link, "expires_at": response.expires_at,
+                "polling_interval": max(1000, getattr(response, "polling_interval", 5000)),
+                "next_poll_at": 0,
             }
-            raise _PendingAuth(AuthResult("qr_required", {
-                "qr_text": response.qr_link, "qr_data_url": _qr_data_url(response.qr_link), "expires_at": response.expires_at / 1000, "experimental": True,
-            }))
+            raise _PendingAuth(_pending_public(self.config))
         if self.action == "code" and pending.get("kind") == "code":
             code = str(self.payload.get("code", ""))
-            if not code.isdigit():
+            if not re.fullmatch(r"[0-9]{4,12}", code):
                 raise ProviderError("invalid_max_code")
             response = await api.send_code(pending["token"], code)
         elif self.action == "password" and pending.get("kind") == "password":
@@ -102,15 +137,18 @@ class _SteppedAuthFlow:
             if not password:
                 raise ProviderError("max_password_required")
             response = await api.check_password(pending["track_id"], password)
+            if getattr(response, "error", None):
+                raise ProviderError("max_password_invalid")
         elif self.action == "sync" and pending.get("kind") == "qr":
             if pending["expires_at"] <= int(time.time() * 1000):
                 self.config.pop("_max_pending", None)
                 raise _PendingAuth(AuthResult("login_required", {"reason": "qr_expired", "experimental": True}))
+            if time.time() * 1000 < pending.get("next_poll_at", 0):
+                raise _PendingAuth(_pending_public(self.config))
             status = await api.check_qr(pending["track_id"])
+            pending["next_poll_at"] = int(time.time() * 1000) + pending.get("polling_interval", 5000)
             if not status.status.login_available:
-                raise _PendingAuth(AuthResult("qr_required", {
-                    "qr_text": pending["qr_text"], "qr_data_url": _qr_data_url(pending["qr_text"]), "expires_at": pending["expires_at"] / 1000, "experimental": True,
-                }))
+                raise _PendingAuth(_pending_public(self.config))
             response = await api.confirm_qr(pending["track_id"])
         else:
             raise ProviderError("max_auth_action_out_of_sequence")
@@ -119,20 +157,55 @@ class _SteppedAuthFlow:
             return MaxAuthResult(token=response.login_token)
         challenge = getattr(response, "password_challenge", None)
         if challenge:
-            self.config["_max_pending"] = {"kind": "password", "track_id": challenge.track_id}
-            raise _PendingAuth(AuthResult("password_required", {"hint": challenge.hint, "experimental": True}))
+            self.config["_max_pending"] = {"kind": "password", "track_id": challenge.track_id,
+                                           "hint": challenge.hint}
+            raise _PendingAuth(_pending_public(self.config))
         # Never silently register a new MAX account.
         raise ProviderError("max_credentials_rejected_or_registration_required")
+
+
+class _ResumableAuthFlow:
+    """Keep SDK bootstrap/handshake alive while each CRM job supplies one step.
+
+    Only private challenge metadata is persisted. A restarted worker recreates
+    the transport and resumes that challenge; code/password stay in memory only.
+    """
+    def __init__(self, config, action, payload, commands, results):
+        self.config, self.action, self.payload = config, action, payload
+        self.commands, self.results = commands, results
+
+    async def authenticate(self, app):
+        action, payload = self.action, self.payload
+        self.payload = None
+        while True:
+            try:
+                return await _SteppedAuthFlow(self.config, action, payload).authenticate(app)
+            except _PendingAuth as pending:
+                self.results.put_nowait(pending.result)
+            except Exception as exc:
+                error = _auth_error(exc, action)
+                if error.code in {"max_transport_error", "max_session_expired"}:
+                    raise error from None
+                self.results.put_nowait(error)
+            finally:
+                payload.clear()
+            action, payload = await self.commands.get()
 
 
 class MaxPersonalAdapter(Adapter):
     PAGE_SIZE = 100
     CHATS_PER_POLL = 10
+    AUTH_WAIT_SECONDS = 45
 
     def __init__(self, config: dict[str, Any]):
         super().__init__(config)
         self.client = None
         self._known_chats = set()
+        self._dirty_chats = {}
+        self._message_sequence = 0
+        self._connect_task = None
+        self._auth_commands = asyncio.Queue()
+        self._auth_results = asyncio.Queue()
 
     def _check_enabled(self):
         if os.environ.get("ENABLE_EXPERIMENTAL", "").lower() != "true":
@@ -151,13 +224,16 @@ class MaxPersonalAdapter(Adapter):
             "store": _ConfigSessionStore(self.config), "persist_session": True,
             "device_id": self.config["_max_device_id"], "reconnect": False,
             "relogin": False, "telemetry": False, "request_timeout": 25.0,
-            "log_level": "ERROR",
+            # SDK error tracebacks may include provider payloads. The worker
+            # logs our stable error codes instead of these raw exceptions.
+            "log_level": "CRITICAL",
         }
         if self.config.get("_max_mt_instance_id"):
             extra_args["mt_instance_id"] = self.config["_max_mt_instance_id"]
         if self.config.get("_max_user_agent"):
             extra_args["user_agent"] = MobileUserAgentPayload.model_validate(self.config["_max_user_agent"])
-        kwargs = {"extra_config": ExtraConfig(**extra_args), "auth_flow": _SteppedAuthFlow(self.config, action, payload or {})}
+        kwargs = {"extra_config": ExtraConfig(**extra_args), "auth_flow": _ResumableAuthFlow(
+            self.config, action, dict(payload or {}), self._auth_commands, self._auth_results)}
         if self.config.get("login_method", "qr") == "sms":
             client = Client(phone=self.config.get("phone", ""), **kwargs)
         else:
@@ -168,12 +244,55 @@ class MaxPersonalAdapter(Adapter):
             # Messages themselves are replayed from remote history. An in-memory
             # push callback is never the sole source of durable message content.
             if message.chat_id is not None:
-                self._known_chats.add(str(message.chat_id))
+                peer = str(message.chat_id)
+                self._known_chats.add(peer)
+                self._message_sequence += 1
+                self._dirty_chats[peer] = self._message_sequence
         return client
+
+    def _verified_identity(self) -> dict:
+        contact = getattr(getattr(self.client, "me", None), "contact", None)
+        user_id = getattr(contact, "id", None)
+        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
+            raise ProviderError("max_own_profile_missing")
+        previous = self.config.get("max_self")
+        if previous and str(previous["id"]) != str(user_id):
+            self.config["max_identity_mismatch"] = True
+            raise ProviderError("max_account_identity_changed")
+        identity = {"id": str(user_id)}
+        phone = str(getattr(contact, "phone", "") or "").lstrip("+")
+        if re.fullmatch(r"[1-9][0-9]{6,14}", phone):
+            identity["phone"] = "+" + phone
+        for name in getattr(contact, "names", []) or []:
+            display = getattr(name, "name", None) or " ".join(filter(None, (
+                getattr(name, "first_name", None), getattr(name, "last_name", None))))
+            if isinstance(display, str) and display.strip():
+                identity["display_name"] = display.strip()[:160]
+                break
+        self.config["max_self"] = {"id": str(user_id)}
+        self.config.pop("max_identity_mismatch", None)
+        return identity
+
+    def _connected(self) -> AuthResult:
+        if not self.client or not self.client.is_connected:
+            raise ProviderError("max_transport_error")
+        return AuthResult("connected", {"experimental": True, "identity": self._verified_identity()})
+
+    def _forget_revoked_session(self) -> None:
+        # Only called for the SDK's explicit invalid LOGIN token response.
+        # Keep provider identity, message cursors, aliases and device fingerprint.
+        self.config.pop("_max_session", None)
+        self.config.pop("_max_pending", None)
 
     async def start(self) -> None:
         self._check_enabled()
+        if self.config.get("max_identity_mismatch"):
+            raise ProviderError("max_account_identity_changed")
+        if self._connect_task and not self._connect_task.done():
+            return  # A pending auth handshake is not an authenticated session.
         if self.client and self.client.is_connected:
+            if self.config.get("max_self") or self.config.get("_max_session"):
+                self._verified_identity()
             return
         if not self.config.get("_max_session"):
             return
@@ -182,48 +301,113 @@ class MaxPersonalAdapter(Adapter):
         self.client = self._make_client()
         try:
             await asyncio.wait_for(self.client.connect(), 45)
+            self._connected()
         except Exception as exc:
             await self.close()
-            raise ProviderError("max_restore_failed") from exc
+            error = _auth_error(exc, "restore")
+            if error.code == "max_session_expired":
+                self._forget_revoked_session()
+            raise error from None
 
     async def auth(self, action: str, payload: dict) -> AuthResult:
         self._check_enabled()
         if action == "disconnect":
             if self.config.get("_max_session"):
-                await self.start()
                 try:
+                    # Logout is permitted even for a rejected identity. This
+                    # transport is used only to revoke its saved session; it
+                    # never goes through poll/send or changes the account pin.
+                    if (not self.client or not self.client.is_connected
+                            or (self._connect_task and not self._connect_task.done())):
+                        await self.close()
+                        self.client = self._make_client()
+                        await asyncio.wait_for(self.client.connect(), 45)
+                    if not self.config.get("max_self"):
+                        self._verified_identity()
                     revoked = await asyncio.wait_for(self.client.logout(), 30)
                 except Exception as exc:
-                    raise ProviderError("max_revoke_unconfirmed") from exc
+                    if _auth_error(exc, "restore").code == "max_session_expired":
+                        self._forget_revoked_session()
+                        revoked = True
+                    else:
+                        raise ProviderError("max_revoke_unconfirmed") from None
                 if not revoked:
                     raise ProviderError("max_revoke_unconfirmed")
             await self.close()
             for key in list(self.config):
                 if key.startswith("_max_"):
                     self.config.pop(key)
+            self.config.pop("max_identity_mismatch", None)
             return AuthResult("disconnected")
+        if action == "qr":
+            action, payload = "login", {"login_method": "qr"}
         if action not in {"login", "code", "password", "sync"}:
             raise ProviderError("unsupported_action")
+        if self.config.get("max_identity_mismatch"):
+            raise ProviderError("max_account_identity_changed")
         if self.config.get("_max_session"):
-            await self.start()
-            return AuthResult("connected", {"experimental": True})
+            try:
+                await self.start()
+            except ProviderError as exc:
+                if exc.code != "max_session_expired" or action != "login":
+                    raise
+                # An explicit new login may proceed after provider-proven
+                # revocation; a network error never discards credentials.
+            else:
+                return self._connected()
+        if action == "login":
+            method = payload.get("login_method", self.config.get("login_method", "qr"))
+            if method not in {"qr", "sms"}:
+                raise ProviderError("max_auth_action_out_of_sequence")
+            phone = payload.get("phone", self.config.get("phone", ""))
+            if method == "sms" and (not isinstance(phone, str) or not re.fullmatch(r"\+[1-9][0-9]{6,14}", phone)):
+                raise ProviderError("max_phone_required")
+            await self.close()
+            self.config["login_method"] = method
+            if method == "sms":
+                self.config["phone"] = phone
+            self.config.pop("_max_pending", None)
+            # A QR WebClient fingerprint cannot be reused as a mobile client.
+            self.config.pop("_max_user_agent", None)
         pending = self.config.get("_max_pending", {})
         if action == "sync" and pending.get("kind") in {"code", "password"}:
-            return AuthResult(pending["kind"] + "_required", {"experimental": True})
-        await self.close()
-        self.client = self._make_client(action, payload)
-        try:
-            await asyncio.wait_for(self.client.connect(), 45)
-        except _PendingAuth as pending:
+            return _pending_public(self.config)
+        if action == "sync" and not pending:
+            return AuthResult("login_required", {"experimental": True})
+        if self._connect_task is None or self._connect_task.done():
             await self.close()
-            return pending.result
-        except ProviderError:
+            self.client = self._make_client(action, payload)
+            self._connect_task = asyncio.create_task(self.client.connect())
+        else:
+            self._auth_commands.put_nowait((action, dict(payload)))
+        result_task = asyncio.create_task(self._auth_results.get())
+        try:
+            done, _ = await asyncio.wait({self._connect_task, result_task}, timeout=self.AUTH_WAIT_SECONDS,
+                                         return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                raise ProviderError("max_transport_error")
+            if self._connect_task in done:
+                await self._connect_task
+                return self._connected()
+            result = result_task.result()
+            if isinstance(result, ProviderError):
+                raise result
+            if result.state == "login_required":
+                await self.close()
+            return result
+        except asyncio.CancelledError:
             await self.close()
             raise
         except Exception as exc:
-            await self.close()
-            raise ProviderError("max_auth_failed") from exc
-        return AuthResult("connected", {"experimental": True})
+            error = _auth_error(exc, action)
+            if error.code == "max_session_expired":
+                self._forget_revoked_session()
+            if error.code not in {"invalid_max_code", "max_code_invalid", "max_password_required", "max_password_invalid"}:
+                await self.close()
+            raise error from None
+        finally:
+            result_task.cancel()
+            await asyncio.gather(result_task, return_exceptions=True)
 
     async def _resolve_peer(self, peer: str) -> int:
         phone = peer.removeprefix("phone:")
@@ -277,7 +461,7 @@ class MaxPersonalAdapter(Adapter):
 
     async def send(self, peer: str, text: str, client_id: str) -> str:
         await self.start()
-        if not self.client:
+        if not self.client or (self._connect_task and not self._connect_task.done()):
             raise ProviderError("max_login_required")
         try:
             nonce = uuid.UUID(client_id).int & ((1 << 53) - 1)
@@ -309,7 +493,7 @@ class MaxPersonalAdapter(Adapter):
 
     async def poll(self) -> list[Event]:
         await self.start()
-        if not self.client:
+        if not self.client or (self._connect_task and not self._connect_task.done()):
             return []
         chats = {str(chat.id): chat for chat in (self.client.chats or [])}
         self._known_chats.update(chats)
@@ -319,27 +503,43 @@ class MaxPersonalAdapter(Adapter):
         if not peers:
             return []
         offset = int(self.config.get("_max_chat_offset", 0)) % len(peers)
-        selected = peers[offset:offset + self.CHATS_PER_POLL]
+        scheduled = peers[offset:offset + self.CHATS_PER_POLL]
+        # Pushes choose which histories to refresh first, but are never the
+        # sole durable source. Keep the fair history round-robin progressing.
+        dirty = dict(self._dirty_chats)
+        urgent = sorted(dirty, key=dirty.get, reverse=True)[:self.CHATS_PER_POLL]
+        selected = list(dict.fromkeys(urgent + scheduled))
         cursors = self.config.setdefault("_max_cursors", {})
         own_id = self.client.me.contact.id if self.client.me else None
-        events = []
+        events = {}
         for peer in selected:
             cursor = cursors.setdefault(peer, {})
+            now = int(time.time() * 1000)
+            days = min(max(int(self.config.get("history_days", 30)), 1), 3650)
+            history_floor = now - days * 86400000
             if "before" not in cursor:
-                now = int(time.time() * 1000)
-                days = min(max(int(self.config.get("history_days", 30)), 1), 3650)
-                cursor.update(floor=cursor.get("watermark", now - days * 86400000), ceiling=now, before=now)
+                cursor.update(floor=cursor.get("watermark", history_floor), ceiling=now, before=now)
             try:
+                # A frozen backfill window must not hide incoming messages
+                # sent after its ceiling. Read the newest page independently.
+                latest = []
+                if cursor["before"] < now:
+                    latest = await asyncio.wait_for(self.client.fetch_history(
+                        chat_id=int(peer), backward=self.PAGE_SIZE, forward=0, from_time=now,
+                    ), 30)
                 messages = await asyncio.wait_for(self.client.fetch_history(
                     chat_id=int(peer), backward=self.PAGE_SIZE, forward=0, from_time=cursor["before"],
                 ), 30)
+                if cursor["before"] == now:
+                    latest = messages  # Same request also serves the independent live tail.
             except Exception as exc:
                 raise ProviderError("max_history_failed") from exc
-            for message in messages:
-                if not cursor["floor"] <= message.time <= cursor["ceiling"]:
+            history = [message for message in messages if cursor["floor"] <= message.time <= cursor["ceiling"]]
+            for message in history + latest:
+                if message.time < history_floor:
                     continue
                 outbound = own_id is not None and message.sender == own_id
-                events.append(Event(
+                events[(peer, str(message.id))] = Event(
                     provider_id=str(message.id), peer=peer,
                     text=message.text or ("[Вложение]" if message.attaches else ""),
                     direction="outbound" if outbound else "inbound", timestamp=message.time / 1000,
@@ -347,7 +547,7 @@ class MaxPersonalAdapter(Adapter):
                     status="sent" if outbound else "received",
                     metadata={"has_media": bool(message.attaches), "canonical_peer": peer,
                               "aliases": self.config.get("_max_peer_aliases", {}).get(peer, [])},
-                ))
+                )
             oldest = min((message.time for message in messages), default=0)
             if len(messages) < self.PAGE_SIZE or oldest <= cursor["floor"]:
                 # Overlap by a minute so slightly late provider events replay.
@@ -358,10 +558,19 @@ class MaxPersonalAdapter(Adapter):
                 raise ProviderError("max_history_timestamp_boundary_overflow")
             else:
                 cursor["before"] = oldest
-        self.config["_max_chat_offset"] = (offset + len(selected)) % len(peers)
-        return events
+            if peer in dirty and self._dirty_chats.get(peer) == dirty[peer]:
+                self._dirty_chats.pop(peer, None)
+        self.config["_max_chat_offset"] = (offset + len(scheduled)) % len(peers)
+        return list(events.values())
 
     async def close(self) -> None:
+        task, self._connect_task = self._connect_task, None
+        if task:
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         if self.client:
             client, self.client = self.client, None
             await client.close()
+        self._auth_commands = asyncio.Queue()
+        self._auth_results = asyncio.Queue()

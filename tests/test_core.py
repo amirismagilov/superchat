@@ -290,3 +290,55 @@ def test_production_rejects_demo_and_sqlite(monkeypatch):
     s = Settings(environment="production", demo=True, database_url="sqlite://", encryption_key="x", jwt_secret="x" * 40)
     with pytest.raises(RuntimeError):
         s.validate()
+
+
+def test_max_guided_connection_needs_no_app_credentials_and_encrypts_auth_jobs(app_client, monkeypatch):
+    client, factory = app_client
+    monkeypatch.setattr(settings, "experimental", True)
+    capability = next(item for item in client.get("/api/capabilities", headers=auth()).json()
+                      if item["channel"] == "max_personal")
+    assert capability["connection"] == {"flow": "qr", "configured": True, "methods": ["qr", "phone"]}
+    response = client.post("/api/accounts", headers=auth(), json={"channel": "max_personal", "label": "MAX", "config": {}})
+    assert response.status_code == 201
+    account_id = response.json()["id"]
+    phone = "+79990000001"
+    for action, payload in [("qr", {}), ("login", {"login_method": "sms", "phone": phone}),
+                            ("code", {"code": "123456"}), ("password", {"password": "test-private-password"})]:
+        result = client.post(f"/api/accounts/{account_id}/actions", headers=auth(), json={"action": action, "payload": payload})
+        assert result.status_code == 202
+        assert set(result.json()) == {"id", "status"}
+        with factory() as db:
+            job = db.get(Job, result.json()["id"])
+            assert unseal(job.encrypted_payload) == payload
+            assert all(value not in job.encrypted_payload for value in payload.values() if len(value) >= 6)
+        public = client.get(f"/api/jobs/{result.json()['id']}", headers=auth()).json()
+        assert set(public) == {"id", "status", "error"}
+    assert phone not in client.get(f"/api/accounts/{account_id}", headers=auth()).text
+
+
+@pytest.mark.parametrize("config", [
+    {"login_method": "external"}, {"login_method": []}, {"phone": "not-a-phone"},
+    {"phone": 79990000001}, {"history_days": True}, {"history_days": 0},
+    {"_max_session": {"token": "not-client-supplied"}},
+])
+def test_max_rejects_invalid_or_private_connection_config(app_client, monkeypatch, config):
+    client, factory = app_client
+    monkeypatch.setattr(settings, "experimental", True)
+    response = client.post("/api/accounts", headers=auth(), json={"channel": "max_personal", "label": "MAX", "config": config})
+    assert response.status_code == 422
+    with factory() as db:
+        assert list(db.scalars(select(Account))) == []
+
+
+@pytest.mark.parametrize("action,payload", [
+    ("login", {"login_method": "external"}), ("login", {"phone": "wrong"}),
+    ("qr", {"track_id": "foreign-challenge"}), ("code", {"code": "123456", "token": "foreign-token"}),
+])
+def test_max_rejects_client_supplied_challenges_before_enqueue(app_client, monkeypatch, action, payload):
+    client, factory = app_client
+    monkeypatch.setattr(settings, "experimental", True)
+    account_id, _ = setup_conversation(client, factory, channel="max_personal")
+    response = client.post(f"/api/accounts/{account_id}/actions", headers=auth(), json={"action": action, "payload": payload})
+    assert response.status_code == 422
+    with factory() as db:
+        assert list(db.scalars(select(Job))) == []

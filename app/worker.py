@@ -35,7 +35,7 @@ class OwnershipLost(RuntimeError):
 
 
 def auth_expired(exc):
-    return isinstance(exc, ProviderError) and exc.code in {"telegram_session_expired", "telegram_account_identity_changed", "whatsapp_account_identity_changed", "provider_unauthorized", "telegram_auth_required", "max_session_expired", "waha_session_expired"}
+    return isinstance(exc, ProviderError) and exc.code in {"telegram_session_expired", "telegram_account_identity_changed", "whatsapp_account_identity_changed", "max_account_identity_changed", "provider_unauthorized", "telegram_auth_required", "max_session_expired", "waha_session_expired"}
 
 
 def auth_error_public(account, code):
@@ -43,6 +43,11 @@ def auth_error_public(account, code):
     # accidentally publish config, stale QR login tokens or raw provider errors.
     public = account.public or {}
     retained = {key: public[key] for key in ("phone", "auth_method", "code_delivery") if key in public}
+    if account.channel == "max_personal":
+        if type(public.get("code_length")) is int and 1 <= public["code_length"] <= 12:
+            retained["code_length"] = public["code_length"]
+        if isinstance(public.get("hint"), str):
+            retained["hint"] = public["hint"][:160]
     return {**retained, "error": code[:96]}
 
 
@@ -166,6 +171,7 @@ async def process_job(account_id, adapter, ownership):
             return True
         job.status = "running"
         job_id, action, payload = job.id, job.action, unseal(job.encrypted_payload)
+        max_auth = db.get(Account, account_id).channel == "max_personal"
         # Auth codes/passwords never survive a completed or interrupted job.
         job.encrypted_payload = None
     ownership.check()
@@ -174,7 +180,10 @@ async def process_job(account_id, adapter, ownership):
         # network connection. Otherwise a failed start leaves it queued forever,
         # bypassing even the expiry check above on every worker retry.
         async with asyncio.timeout(AUTH_JOB_TIMEOUT):
-            await adapter.start()
+            # MAX auth owns its bootstrap: it must handle an expired token on
+            # explicit login and revoke an accidentally linked other identity.
+            if not max_auth:
+                await adapter.start()
             ownership.check()
             result = await adapter.auth(action, payload)
         ownership.check()

@@ -350,29 +350,33 @@ async def test_revoked_telegram_session_changes_account_state_and_stops_polling(
 
 
 @pytest.mark.asyncio
-async def test_wrong_code_preserves_retry_step_and_scrubs_completed_job_payload(worker_store):
+@pytest.mark.parametrize("channel,state,error,extra", [
+    ("telegram", "awaiting_code", "telegram_code_invalid", {}),
+    ("max_personal", "code_required", "max_code_invalid", {"code_length": 6, "hint": "Work account"}),
+])
+async def test_wrong_code_preserves_retry_step_and_scrubs_completed_job_payload(worker_store, channel, state, error, extra):
     with worker_store.Session.begin() as db:
         account = db.get(Account, worker_store.account_id)
-        account.state = "awaiting_code"
-        account.public = {"phone": "+79990000001", "auth_method": "phone", "code_delivery": "telegram_or_sms"}
+        account.channel, account.state = channel, state
+        account.public = {"phone": "+79990000001", "auth_method": "phone", "code_delivery": "telegram_or_sms", **extra}
         job = Job(account_id=account.id, action="code", encrypted_payload=seal({"code": "12345"}))
         db.add(job)
         db.flush()
         job_id = job.id
     a = fake_adapter()
-    a.auth.side_effect = ProviderError("telegram_code_invalid")
+    a.auth.side_effect = ProviderError(error)
     assert await worker.process_job(worker_store.account_id, a, Mock())
     with worker_store.Session() as db:
         account = db.get(Account, worker_store.account_id)
-        assert account.state == "awaiting_code"
+        assert account.state == state
         assert account.public == {"phone": "+79990000001", "auth_method": "phone",
-                                  "code_delivery": "telegram_or_sms", "error": "telegram_code_invalid"}
+                                  "code_delivery": "telegram_or_sms", "error": error, **extra}
         job = db.get(Job, job_id)
         assert job.status == "failed" and job.encrypted_payload is None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("code", ["telegram_account_identity_changed", "whatsapp_account_identity_changed"])
+@pytest.mark.parametrize("code", ["telegram_account_identity_changed", "whatsapp_account_identity_changed", "max_account_identity_changed"])
 async def test_identity_change_blocks_outbox_even_if_previous_state_was_connected(worker_store, code):
     enqueue(worker_store)
     with worker_store.Session.begin() as db:
@@ -384,6 +388,40 @@ async def test_identity_change_blocks_outbox_even_if_previous_state_was_connecte
         assert db.get(Account, worker_store.account_id).state == "reauth_required"
     assert await worker.process_outbox(worker_store.account_id, a, Mock()) is False
     a.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_max_disconnect_uses_revoke_path_even_after_identity_mismatch(worker_store):
+    message_id = enqueue(worker_store)
+    with worker_store.Session.begin() as db:
+        account = db.get(Account, worker_store.account_id)
+        account.channel, account.state = "max_personal", "reauth_required"
+        db.add(Job(account_id=account.id, action="disconnect", encrypted_payload=seal({})))
+    adapter = fake_adapter()
+    adapter.start.side_effect = ProviderError("max_account_identity_changed")
+    adapter.auth.return_value = AuthResult("disconnected")
+    assert await worker.process_job(worker_store.account_id, adapter, Mock())
+    adapter.start.assert_not_awaited()
+    adapter.auth.assert_awaited_once_with("disconnect", {})
+    with worker_store.Session() as db:
+        assert db.get(Account, worker_store.account_id).state == "disconnected"
+        assert db.get(Message, message_id).status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_max_explicit_qr_can_recover_expired_token_before_prestart(worker_store):
+    with worker_store.Session.begin() as db:
+        account = db.get(Account, worker_store.account_id)
+        account.channel, account.state = "max_personal", "reauth_required"
+        db.add(Job(account_id=account.id, action="qr", encrypted_payload=seal({})))
+    adapter = fake_adapter()
+    adapter.start.side_effect = ProviderError("max_session_expired")
+    adapter.auth.return_value = AuthResult("qr_required", {"auth_method": "qr"})
+    assert await worker.process_job(worker_store.account_id, adapter, Mock())
+    adapter.start.assert_not_awaited()
+    adapter.auth.assert_awaited_once_with("qr", {})
+    with worker_store.Session() as db:
+        assert db.get(Account, worker_store.account_id).state == "qr_required"
 
 
 @pytest.mark.asyncio
