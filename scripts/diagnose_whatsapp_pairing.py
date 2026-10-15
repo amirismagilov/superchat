@@ -147,7 +147,7 @@ def containers(runner):
     ids=raw.decode('ascii',errors='ignore').split()
     if status!='ok' or not ids or any(not re.fullmatch('[a-f0-9]{12,64}',x) for x in ids):return {'status':status if status!='ok' else 'no_valid_containers'}
     target='NODE_OPTIONS=--max-old-space-size=16384 --dns-result-order=ipv4first --no-network-family-autoselection'
-    template='{{$fixed := false}}{{$legacy := false}}{{range .Config.Env}}{{if eq . "'+target+'"}}{{$fixed = true}}{{end}}{{if eq . "NODE_OPTIONS=--max-old-space-size=16384"}}{{$legacy = true}}{{end}}{{end}}{"service":{{json (index .Config.Labels "com.docker.compose.service")}},"state":{{json .State.Status}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}},"restarts":{{.RestartCount}},"oom":{{.State.OOMKilled}},"ipv4_options_exact":{{$fixed}},"legacy_options_exact":{{$legacy}}'
+    template='{{$fixed := false}}{{$legacy := false}}{{range .Config.Env}}{{if eq . "'+target+'"}}{{$fixed = true}}{{end}}{{if eq . "NODE_OPTIONS=--max-old-space-size=16384"}}{{$legacy = true}}{{end}}{{end}}{"service":{{json (index .Config.Labels "com.docker.compose.service")}},"state":{{json .State.Status}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}"none"{{end}},"restarts":{{.RestartCount}},"oom":{{.State.OOMKilled}},"ipv4_options_exact":{{$fixed}},"legacy_options_exact":{{$legacy}}}'
     status,raw,_=runner.capture(['docker','inspect','--format',template,*ids[:12]])
     result={'status':status,'services':[],'truncated':len(ids)>12}
     if status=='ok':
@@ -236,13 +236,18 @@ def timeline(raw, capture_truncated=False):
             if 515 in codes:event['restart_required']=True
             events.append(event)
             key=hashed or 'unattributed'
-            summary=summaries.setdefault(key,{'session_hash':hashed,'event_count':0,'first_event_utc':stamp,'latest_event_utc':stamp,'event_counts':{},'status_codes':[],'error_codes':[],'reason_counts':{},'last_event':None})
+            summary=summaries.setdefault(key,{'session_hash':hashed,'event_count':0,'first_event_utc':stamp,'latest_event_utc':stamp,'event_counts':{},'status_codes':[],'error_codes':[],'reason_counts':{},'last_event':None,'pairing_events':[],'pairing_events_truncated':False})
             summary['event_count']+=1;summary['event_counts'][marker]=summary['event_counts'].get(marker,0)+1
             summary['last_event']={'timestamp_utc':stamp,'event':marker}
             if marker_index==0:
                 summary['status_codes']=sorted(set(summary['status_codes'])|set(codes))
                 summary['error_codes']=sorted(set(summary['error_codes'])|set(errors))
                 for reason in reasons:summary['reason_counts'][reason]=summary['reason_counts'].get(reason,0)+1
+            if marker in {'pairing_configured','pairing_failed','connection_opened','connection_validation_failed','prekeys_upload_failed','account_signature_invalid','stream_error'} or (marker_index==0 and any(code in {401,403,428,440,500,503,515} for code in codes)):
+                summary['pairing_events'].append({'at':stamp,'event':marker,'codes':codes,'reasons':reasons,'errors':errors})
+                if len(summary['pairing_events'])>20:
+                    summary['pairing_events']=summary['pairing_events'][-20:]
+                    summary['pairing_events_truncated']=True
             if stamp:
                 summary['first_event_utc']=min(summary['first_event_utc'] or stamp,stamp)
                 summary['latest_event_utc']=max(summary['latest_event_utc'] or stamp,stamp)
@@ -311,6 +316,9 @@ def compact_report(report):
         row['events']={key:value for key,value in summary.get('event_counts',{}).items() if key in important}
         for key in ('status_codes','error_codes','reason_counts','last_event'):
             if summary.get(key):row[key]=summary[key]
+        if summary.get('event_counts',{}).get('pairing_configured'):
+            row['pairing_events']=summary.get('pairing_events',[])
+            row['pairing_events_truncated']=summary.get('pairing_events_truncated',False)
         jobs=account.get('jobs',[])
         if jobs:row['latest_job']=jobs[0]
         result['accounts'].append(row)

@@ -33,6 +33,26 @@ class Python310Datetime:
 
 
 class PairingTests(unittest.TestCase):
+    def test_pairing_sequence_survives_unrelated_reconnect_noise(self):
+        rows=[]
+        for index,(msg,code) in enumerate((('pairing configured successfully',None),('stream errored out',515),
+                ('Failed to upload pre-keys to server',428),('opened connection to WA',None),('connection errored',401))):
+            rows.append(json.dumps({'time':1792058400000+index*1000,'session':'paired','msg':msg,'code':code,'secret':'SECRET'}))
+        rows += [json.dumps({'time':1792058410000+n,'session':'unrelated','msg':'connection errored','trace':'ETIMEDOUT SECRET'}) for n in range(100)]
+        timeline=diag.timeline('\n'.join(rows).encode())
+        self.assertTrue(timeline['events_truncated'])
+        account={'account_hash':'a'*12,'session_hash':diag.session_hash('paired')}
+        compact=diag.compact_report({'timeline':timeline,'accounts':{'accounts':[account]}})
+        events=compact['accounts'][0]['pairing_events']
+        self.assertEqual([event['codes'] for event in events],[[],[515],[428],[],[401]])
+        self.assertEqual([event['at'] for event in events],sorted(event['at'] for event in events))
+        self.assertFalse(compact['accounts'][0]['pairing_events_truncated'])
+        self.assertNotIn('SECRET',json.dumps(compact))
+        report=diag.timeline('\n'.join(rows[:1]+[rows[1]]*30).encode())
+        summary=report['session_summaries'][0]
+        self.assertEqual(len(summary['pairing_events']),20)
+        self.assertTrue(summary['pairing_events_truncated'])
+
     def test_normal_delayed_restart_is_not_a_transport_timeout(self):
         report=diag.timeline(json.dumps({'time':1792058400000,'session':'session-a',
             'msg':'Job scheduled with timeout 2000 ms','job':'start-engine'}).encode())
