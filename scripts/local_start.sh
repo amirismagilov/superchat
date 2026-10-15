@@ -51,6 +51,16 @@ case "$docker_endpoint" in
   *) echo "Select a local Docker Desktop/Engine context using a Unix socket. Remote Docker targets are not supported by this local-login launcher." >&2; exit 1 ;;
 esac
 
+# Another checkout may own this Compose project's persistent data. Generating
+# replacement encryption/database keys would make those data unreadable.
+if [ ! -f .env.local-docker ]; then
+  local_volumes="$(docker volume ls --format '{{.Name}}' --filter 'label=com.docker.compose.project=omnicrm-local')"
+  if [ -n "$local_volumes" ]; then
+    echo 'Existing local CRM data found. Start it from its original folder with .env.local-docker; do not generate replacement keys.' >&2
+    exit 1
+  fi
+fi
+
 # Use the same Python base image as the app: no host Python/Xcode install needed.
 docker_architecture="$(docker info --format '{{.Architecture}}')"
 docker run --rm --network none --read-only \
@@ -61,7 +71,7 @@ docker run --rm --network none --read-only \
 
 # Do not let a developer's inherited production/demo environment override the
 # dedicated local credential file. LOCAL_PORT is the sole convenience override.
-compose=(env -u DATABASE_URL -u ENCRYPTION_KEY -u JWT_SECRET -u WAHA_API_KEY -u POSTGRES_PASSWORD -u SMS_GATEWAY_URL -u WAHA_IMAGE docker compose --project-name omnicrm-local --env-file "$project_root/.env.local-docker" -f "$project_root/compose.local.yaml")
+compose=(env -u DATABASE_URL -u ENCRYPTION_KEY -u JWT_SECRET -u WAHA_API_KEY -u POSTGRES_PASSWORD -u SMS_GATEWAY_URL -u WAHA_IMAGE -u TELEGRAM_PROXY_URL docker compose --project-name omnicrm-local --env-file "$project_root/.env.local-docker" -f "$project_root/compose.local.yaml")
 "${compose[@]}" config --quiet
 build_option=--no-build
 if [ "$build_enabled" = true ]; then
@@ -87,7 +97,7 @@ if ! "${compose[@]}" up -d "$build_option" --wait --wait-timeout 180; then
 fi
 
 # Also validate explicit runtime flags instead of treating any HTTP 200 as success.
-"${compose[@]}" exec -T api python -c "import json,urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready',timeout=5); r=json.load(urllib.request.urlopen('http://127.0.0.1:8080/api/runtime',timeout=5)); assert r.get('local_test') is True and r.get('demo') is False, 'Unexpected runtime mode'"
+"${compose[@]}" exec -T api python -c "import json,urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready',timeout=5); r=json.load(urllib.request.urlopen('http://127.0.0.1:8080/api/runtime',timeout=5)); assert r.get('local_test') is True and r.get('demo') is False, 'Unexpected runtime mode'" </dev/null
 published_address="$("${compose[@]}" port api 8080)"
 case "$published_address" in
   127.0.0.1:*) ;;
