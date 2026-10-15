@@ -24,7 +24,7 @@ class TelegramDiagnosticTests(unittest.TestCase):
         account = SimpleNamespace(id='PRIVATE_ACCOUNT_ID', tenant_id='PRIVATE_TENANT', state='SECRET_STATE', label='SECRET_LABEL', encrypted_config='SECRET_ENCRYPTED_CONFIG', updated_at=current - timedelta(seconds=25), public={'error': 'SECRET_ERROR_WITH_PHONE', 'phone': 'SECRET_PHONE', 'qr_text': 'SECRET_QR', 'identity': {'id': 'SECRET_TELEGRAM_ID'}, 'retrying': 'SECRET_UNEXPECTED_VALUE'})
         job = SimpleNamespace(action='SECRET_ACTION', status='SECRET_STATUS', error='SECRET_JOB_ERROR', created_at=current, encrypted_payload='SECRET_CODE_PASSWORD')
         result = diag.account_summary(account, [job] * 5, 1, True, current)
-        result['environment'] = diag.environment_summary({'DATABASE_URL': 'SECRET_CONNECTION_URL', 'ENCRYPTION_KEY': 'SECRET_ENCRYPTION_KEY', 'WORKER_HEARTBEAT_PATH': '/SECRET_PATH', 'TELEGRAM_API_HASH': 'SECRET_API_HASH'})
+        result['environment'] = diag.environment_summary({'DATABASE_URL': 'SECRET_CONNECTION_URL', 'ENCRYPTION_KEY': 'SECRET_ENCRYPTION_KEY', 'WORKER_HEARTBEAT_PATH': '/SECRET_PATH', 'TELEGRAM_API_HASH': 'SECRET_API_HASH', 'TELEGRAM_PROXY_URL': 'socks5://SECRET_CREDENTIALS@proxy.invalid:1080'})
         output = json.dumps(result)
         for sensitive in ('SECRET', account.id, account.tenant_id):
             self.assertNotIn(sensitive, output)
@@ -33,6 +33,7 @@ class TelegramDiagnosticTests(unittest.TestCase):
         self.assertEqual(result['updated_age_seconds'], 25)
         self.assertEqual(len(result['jobs']), 3)
         self.assertTrue(all(type(value) is bool for value in result['environment'].values()))
+        self.assertTrue(result['environment']['telegram_proxy_configured'])
 
     def test_known_errors_actions_and_states_are_preserved(self):
         current = datetime.now(timezone.utc)
@@ -44,6 +45,7 @@ class TelegramDiagnosticTests(unittest.TestCase):
         self.assertEqual(result['jobs'][0], {'action': 'login', 'status': 'queued', 'error': 'worker_interrupted_retry_login', 'age_seconds': 200})
         self.assertFalse(result['shared_configuration_exists'])
         self.assertEqual(diag.safe_error('provider_auth_timeout'), 'provider_auth_timeout')
+        self.assertEqual(diag.safe_error('telegram_proxy_configuration_invalid'), 'telegram_proxy_configuration_invalid')
 
     def test_heartbeat_is_metadata_only_and_absence_does_not_mean_worker_down(self):
         current = datetime.now(timezone.utc)

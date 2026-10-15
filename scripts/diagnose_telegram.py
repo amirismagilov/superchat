@@ -29,6 +29,7 @@ ERROR_CODES = frozenset({
     'telegram_flood_wait', 'telegram_session_expired', 'telegram_auth_key_unavailable',
     'telegram_code_invalid', 'telegram_code_expired', 'telegram_password_invalid',
     'telegram_phone_invalid', 'telegram_phone_banned', 'telegram_configuration_invalid',
+    'telegram_proxy_configuration_invalid',
     'telegram_app_not_configured', 'telegram_qr_expired', 'telegram_qr_invalid',
     'telegram_account_restricted', 'telegram_nonce_already_used',
     'telegram_transport_error', 'telegram_server_error', 'telegram_request_rejected',
@@ -89,6 +90,7 @@ def environment_summary(environment):
         'database_url_present': bool(environment.get('DATABASE_URL')),
         'encryption_key_present': bool(environment.get('ENCRYPTION_KEY')),
         'worker_heartbeat_path_present': bool(environment.get('WORKER_HEARTBEAT_PATH')),
+        'telegram_proxy_configured': bool(environment.get('TELEGRAM_PROXY_URL')),
     }
 
 

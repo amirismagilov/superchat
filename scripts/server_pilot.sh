@@ -28,7 +28,7 @@ elif [ ! -f .env.pilot ]; then
   exit 0
 fi
 # Use the port saved with the pilot's credentials, including on later restarts.
-compose=(env -u LOCAL_PORT -u DATABASE_URL -u ENCRYPTION_KEY -u JWT_SECRET -u WAHA_API_KEY -u POSTGRES_PASSWORD -u SMS_GATEWAY_URL -u WAHA_IMAGE docker compose --project-name omnicrm-pilot --env-file "$project_root/.env.pilot" -f "$project_root/compose.pilot.yaml")
+compose=(env -u LOCAL_PORT -u DATABASE_URL -u ENCRYPTION_KEY -u JWT_SECRET -u WAHA_API_KEY -u POSTGRES_PASSWORD -u SMS_GATEWAY_URL -u WAHA_IMAGE -u TELEGRAM_PROXY_URL docker compose --project-name omnicrm-pilot --env-file "$project_root/.env.pilot" -f "$project_root/compose.pilot.yaml")
 "${compose[@]}" config --quiet
 case "$action" in
   start)

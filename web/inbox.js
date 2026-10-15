@@ -70,6 +70,7 @@ function connectionError(error) {
     telegram_qr_invalid: 'QR-код больше не действует. Получите новый код.',
     telegram_app_not_configured: 'Администратор ещё не настроил подключение Telegram для команды.',
     telegram_configuration_invalid: 'Настройки Telegram требуют проверки администратором.',
+    telegram_proxy_configuration_invalid: 'Администратору нужно проверить настройки соединения сервера с Telegram.',
     telegram_transport_error: 'Сервер не смог установить связь с Telegram. Повторите вход. Если ошибка повторится, администратору нужно проверить доступ сервера к Telegram.',
     telegram_server_error: 'Telegram временно не ответил. Повторите вход немного позже.',
     provider_auth_timeout: 'Подключение не завершилось вовремя. Повторите вход. Если ожидание повторится, попросите администратора проверить связь сервера с мессенджером.',

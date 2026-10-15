@@ -24,7 +24,7 @@ else
   endpoint="$(docker context inspect --format '{{(index .Endpoints "docker").Host}}')"
 fi
 case "$endpoint" in unix://*) ;; *) fail 'Use the local Docker Engine on this server.' ;; esac
-compose=(env -u LOCAL_PORT -u DATABASE_URL -u ENCRYPTION_KEY -u JWT_SECRET -u WAHA_API_KEY -u POSTGRES_PASSWORD -u SMS_GATEWAY_URL -u WAHA_IMAGE docker compose --project-name omnicrm-pilot --env-file "$target/.env.pilot" -f "$target/compose.pilot.yaml")
+compose=(env -u LOCAL_PORT -u DATABASE_URL -u ENCRYPTION_KEY -u JWT_SECRET -u WAHA_API_KEY -u POSTGRES_PASSWORD -u SMS_GATEWAY_URL -u WAHA_IMAGE -u TELEGRAM_PROXY_URL docker compose --project-name omnicrm-pilot --env-file "$target/.env.pilot" -f "$target/compose.pilot.yaml")
 pinned_waha_image='devlikeapro/waha:noweb-2026.9.2@sha256:be61f8cd7774ab22bd1b755cbc539f98d71d81d5ca83555fdddfa4fddd7924e1'
 # Inspect only option-match booleans, image ID and mounts; never emit environment values.
 waha_inspect_format='{{$default := false}}{{$target := false}}{{$custom := false}}{{$proxy := false}}{{range .Config.Env}}{{$parts := split . "="}}{{$key := index $parts 0}}{{if eq $key "NODE_OPTIONS"}}{{if eq . "NODE_OPTIONS=--max-old-space-size=16384"}}{{$default = true}}{{else if eq . "NODE_OPTIONS=--max-old-space-size=16384 --dns-result-order=ipv4first --no-network-family-autoselection"}}{{$target = true}}{{else}}{{$custom = true}}{{end}}{{end}}{{if or (eq $key "WHATSAPP_PROXY_SERVER") (eq $key "WHATSAPP_PROXY_SERVER_LIST") (eq $key "WAHA_PROXY") (eq $key "HTTP_PROXY") (eq $key "HTTPS_PROXY") (eq $key "ALL_PROXY") (eq $key "http_proxy") (eq $key "https_proxy") (eq $key "all_proxy")}}{{if ne . (printf "%s=" $key)}}{{$proxy = true}}{{end}}{{end}}{{end}}{"image":{{json .Image}},"mounts":{{json .Mounts}},"node_default":{{$default}},"node_target":{{$target}},"node_custom":{{$custom}},"proxy_configured":{{$proxy}}}'
@@ -366,7 +366,7 @@ else:
     fail('Unknown updater operation')
 PY
 python3 "$stage/control.py" extract "$target" "$archive" "$stage"
-new_compose=(env -u LOCAL_PORT -u DATABASE_URL -u ENCRYPTION_KEY -u JWT_SECRET -u WAHA_API_KEY -u POSTGRES_PASSWORD -u SMS_GATEWAY_URL -u WAHA_IMAGE docker compose --project-name omnicrm-pilot --env-file "$target/.env.pilot" -f "$stage/compose.pilot.yaml")
+new_compose=(env -u LOCAL_PORT -u DATABASE_URL -u ENCRYPTION_KEY -u JWT_SECRET -u WAHA_API_KEY -u POSTGRES_PASSWORD -u SMS_GATEWAY_URL -u WAHA_IMAGE -u TELEGRAM_PROXY_URL docker compose --project-name omnicrm-pilot --env-file "$target/.env.pilot" -f "$stage/compose.pilot.yaml")
 "${compose[@]}" config --format json > "$stage/old-config.json"
 "${new_compose[@]}" config --format json > "$stage/new-config.json"
 python3 "$stage/control.py" config "$target" "$stage/old-config.json" "$stage/new-config.json" "$stage/waha-plan"

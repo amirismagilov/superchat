@@ -13,12 +13,17 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from io import BytesIO
 import hashlib
+import ipaddress
+import logging
+import os
 import re
 import math
 import time
 from typing import Any
 from uuid import UUID
+from urllib.parse import unquote, urlsplit
 
+from python_socks import ProxyError, ProxyConnectionError, ProxyTimeoutError
 from telethon import TelegramClient, errors, functions, types
 from telethon.sessions import StringSession
 
@@ -28,6 +33,64 @@ from .base import Adapter, AuthResult, Event, ProviderError
 REVOKED_KEYS = (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError,
                 errors.AuthKeyPermEmptyError, errors.SessionExpiredError,
                 errors.SessionRevokedError, errors.AuthKeyDuplicatedError)
+
+
+class _PrivateTransportLogger(logging.Logger):
+    """Telethon interpolates raw proxy/server errors; core logs safe error codes."""
+
+    def getChild(self, suffix):
+        return self
+
+
+_TRANSPORT_LOGGER = _PrivateTransportLogger("omnicrm.telegram.transport", logging.CRITICAL + 1)
+_TRANSPORT_LOGGER.propagate = False
+_TRANSPORT_LOGGER.addHandler(logging.NullHandler())
+
+
+def _deployment_proxy() -> dict[str, Any] | None:
+    """Only the deployment can select a route; never persist proxy credentials."""
+    raw = os.environ.get("TELEGRAM_PROXY_URL", "")
+    if raw == "":
+        return None
+    try:
+        if len(raw) > 2048 or any(ord(c) <= 32 or 127 <= ord(c) <= 159 for c in raw):
+            raise ValueError
+        if re.search(r"%(?![0-9a-fA-F]{2})", raw):
+            raise ValueError
+        parsed = urlsplit(raw)
+        if parsed.scheme not in {"socks5", "http"} or parsed.path or parsed.query or parsed.fragment:
+            raise ValueError
+        # Even empty query/fragment delimiters are outside this configuration format.
+        if "?" in raw or "#" in raw or parsed.netloc.count("@") > 1:
+            raise ValueError
+        host, port = parsed.hostname, parsed.port
+        if not host or not port or not re.fullmatch(r"[0-9]{1,5}", parsed.netloc.rsplit(":", 1)[-1]):
+            raise ValueError
+        port_text = parsed.netloc.rsplit(":", 1)[-1]
+        host_text = f"[{host}]" if ":" in host else host
+        if parsed.netloc.rsplit("@", 1)[-1].lower() != f"{host_text}:{port_text}".lower():
+            raise ValueError
+        if ":" in host:
+            ipaddress.IPv6Address(host)
+            if "%" in host:
+                raise ValueError
+        elif len(host) > 253 or not all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                                      for label in host.removesuffix(".").split(".")):
+            raise ValueError
+        username, password = parsed.username, parsed.password
+        if (username is None) != (password is None):
+            raise ValueError
+        if username is not None:
+            username, password = (unquote(value, encoding="utf-8", errors="strict")
+                                  for value in (username, password))
+            if any(not value or len(value.encode("utf-8")) > 255
+                   or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value)
+                   for value in (username, password)):
+                raise ValueError
+        return {"proxy_type": parsed.scheme, "addr": host, "port": port,
+                "rdns": True, "username": username, "password": password}
+    except (ValueError, TypeError, UnicodeError):
+        raise ProviderError("telegram_proxy_configuration_invalid") from None
 
 
 class TelegramAdapter(Adapter):
@@ -72,7 +135,8 @@ class TelegramAdapter(Adapter):
         except errors.RandomIdDuplicateError:
             # The server remembers this nonce, but this response has no message id.
             raise ProviderError("telegram_nonce_already_used", uncertain=sending) from None
-        except (asyncio.TimeoutError, ConnectionError, OSError):
+        except (asyncio.TimeoutError, ConnectionError, OSError,
+                ProxyError, ProxyConnectionError, ProxyTimeoutError):
             raise ProviderError("telegram_transport_error", uncertain=sending) from None
         except errors.ServerError:
             raise ProviderError("telegram_server_error", uncertain=sending) from None
@@ -94,6 +158,7 @@ class TelegramAdapter(Adapter):
                     raise ProviderError("telegram_configuration_invalid") from None
                 self.client = TelegramClient(
                     session, api_id, api_hash,
+                    proxy=_deployment_proxy(), base_logger=_TRANSPORT_LOGGER,
                     receive_updates=False, flood_sleep_threshold=0,
                     request_retries=0, connection_retries=1, timeout=15,
                     raise_last_call_error=True,

@@ -90,6 +90,7 @@ services:
       WORKER_SHARD_COUNT: "16"
       WORKER_SHARDS: ${WORKER_SHARDS:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
       WORKER_HEARTBEAT_PATH: /tmp/omnicrm-worker.heartbeat
+      TELEGRAM_PROXY_URL: ${TELEGRAM_PROXY_URL:-}
     depends_on:
       migrate:
         condition: service_completed_successfully
