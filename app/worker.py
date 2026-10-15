@@ -27,6 +27,7 @@ SHARD_COUNT = int(os.getenv("WORKER_SHARD_COUNT", "16"))
 SHARDS = [int(x) for x in os.getenv("WORKER_SHARDS", ",".join(map(str, range(SHARD_COUNT)))).split(",")]
 INTERVAL = float(os.getenv("ACCOUNT_POLL_SECONDS", "3"))
 AUTH_JOB_TIMEOUT = 90
+WHATSAPP_LATE_AUTH_INTERVAL = 15
 
 
 class OwnershipLost(RuntimeError):
@@ -293,7 +294,9 @@ async def account_loop(account_id, ownership, stop, semaphore):
         return
     adapter = None
     failures = 0
+    next_late_auth_check = 0.0
     while not stop.is_set():
+        late_auth_check = False
         try:
             async with semaphore:
                 ownership.check()
@@ -306,8 +309,17 @@ async def account_loop(account_id, ownership, stop, semaphore):
                     # or send; idle/disconnected accounts do not connect here.
                 await process_job(account_id, adapter, ownership)
                 with Session() as db:
-                    state = db.get(Account, account_id).state
-                if state in {"connecting", "qr_required", "awaiting_qr"}:
+                    account = db.get(Account, account_id)
+                    state = account.state
+                    late_auth_check = (account.channel == "whatsapp_web"
+                                       and state == "action_required"
+                                       and (account.public or {}).get("error") == "waha_connect_timeout"
+                                       and time.monotonic() >= next_late_auth_check)
+                # A UI wait deadline is not a provider logout. Continue reading
+                # the existing WAHA session so a late verified login is observed.
+                # Keep processing jobs every cycle, including explicit disconnect.
+                if state in {"connecting", "qr_required", "awaiting_qr"} or late_auth_check:
+                    next_late_auth_check = time.monotonic() + WHATSAPP_LATE_AUTH_INTERVAL
                     result = await asyncio.wait_for(adapter.auth("sync", {}), timeout=45)
                     ownership.check()
                     with Session.begin() as db:
@@ -316,6 +328,7 @@ async def account_loop(account_id, ownership, stop, semaphore):
                         a.state, a.public = result.state, result.public
                         a.encrypted_config, a.updated_at = seal(adapter.config), now()
                     state = result.state
+                    late_auth_check = False
                 if state == "connected":
                     # Commit pending inbound/cursors before handling another send.
                     await poll_account(account_id, adapter, ownership)
@@ -341,7 +354,13 @@ async def account_loop(account_id, ownership, stop, semaphore):
                 with Session.begin() as db:
                     fence_transaction(db, ownership, account_id)
                     a = db.get(Account, account_id)
-                    a.public = {"error": str(code)[:96], "retrying": True}
+                    if late_auth_check and not auth_expired(exc):
+                        # A temporary status-read failure must not abandon the
+                        # late-login monitor or replace its original deadline.
+                        a.public = {**(a.public or {}), "error": "waha_connect_timeout",
+                                    "status_check_error": str(code)[:96], "retrying": True}
+                    else:
+                        a.public = {"error": str(code)[:96], "retrying": True}
                     if auth_expired(exc):
                         a.state = "reauth_required"
             except OwnershipLost:

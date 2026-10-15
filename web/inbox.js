@@ -81,7 +81,7 @@ function connectionError(error) {
     waha_server_error: 'Шлюз WhatsApp временно недоступен. Повторите проверку через некоторое время.',
     waha_rate_limited: 'WhatsApp просит подождать перед следующей попыткой.',
     waha_request_rejected: 'WhatsApp не подтвердил запрос. Проверьте связанные устройства на телефоне и повторите попытку.',
-    waha_connect_timeout: 'WhatsApp не завершил подключение за 2 минуты. Повторите подключение. Если ожидание повторится, попросите администратора проверить связь сервера с WhatsApp.',
+    waha_connect_timeout: 'Подтверждение WhatsApp занимает больше двух минут. Продолжаем проверять подключение. При необходимости можно повторить попытку.',
     waha_session_failed: 'Сеанс WhatsApp завершился с ошибкой. Повторите подключение.',
     waha_session_stopped: 'Сеанс WhatsApp остановлен. Повторите подключение, чтобы запустить его снова.',
     auth_job_expired: 'Запрос входа устарел. Начните подключение ещё раз.',
@@ -750,7 +750,8 @@ export class OmniInbox extends HTMLElement {
         if (account) stage.append(el('div', { class: 'qr-actions' }, [button(waQrBlocked || ['new', 'created'].includes(account.state) ? 'Повторить подключение' : 'Обновить QR-код', () => runAction(telegram ? 'qr' : 'login'), '', 'refresh'), telegram ? button('Войти по номеру телефона', () => { authMethod = 'phone'; phoneEntry = true; showError(''); render(true); }, 'subtle') : null]));
         if (!telegram) stage.append(el('p', { class: 'connection-caution' }, 'Подключение через связанные устройства использует неофициальную интеграцию. WhatsApp может ограничить её работу.'));
       } else {
-        stage.append(el('div', { class: 'connection-unavailable' }, [el('div', { class: 'setup-illustration' }, icon(disconnected ? 'check' : 'refresh', 28)), el('h3', {}, disconnected ? 'Аккаунт отключён' : 'Нужно повторить подключение'), el('p', {}, disconnected ? 'История переписки сохранена в CRM.' : 'Откройте приложение на телефоне и начните вход ещё раз.'), button('Подключить снова', () => { disconnected = false; if (telegram) { authMethod = 'phone'; phoneEntry = true; showError(''); render(true); } else runAction('login'); }, 'primary')]));
+        const lateWhatsApp = !telegram && !disconnected && account?.state === 'action_required' && account.public?.error === 'waha_connect_timeout';
+        stage.append(el('div', { class: 'connection-unavailable' }, [el('div', { class: 'setup-illustration' }, icon(disconnected ? 'check' : 'refresh', 28)), el('h3', {}, disconnected ? 'Аккаунт отключён' : lateWhatsApp ? 'Подтверждение подключения задерживается' : 'Нужно повторить подключение'), el('p', {}, disconnected ? 'История переписки сохранена в CRM.' : lateWhatsApp ? 'Если WhatsApp завершит вход, статус обновится автоматически.' : 'Откройте приложение на телефоне и начните вход ещё раз.'), button('Подключить снова', () => { disconnected = false; if (telegram) { authMethod = 'phone'; phoneEntry = true; showError(''); render(true); } else runAction('login'); }, 'primary')]));
       }
       if (!telegram) {
         if (account?.public?.error) showError(new Error(account.public.error), 'provider');

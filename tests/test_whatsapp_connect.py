@@ -74,12 +74,72 @@ def test_scanning_finishes_between_status_and_qr(status):
     assert "identity" not in result.public
 
 
-@pytest.mark.parametrize("value", [None, "", {"token": "untrusted"}, "x" * 5000])
+@pytest.mark.parametrize("value", [None, {"token": "untrusted"}, "x" * 5000])
 def test_invalid_qr_is_a_safe_provider_error(value):
     def handler(request):
         return httpx.Response(200, json={"value": value} if request.url.path.endswith("/auth/qr") else {"status": "SCAN_QR_CODE"})
     with pytest.raises(ProviderError, match="waha_invalid_qr_response"):
         exercise(handler)
+
+
+def test_empty_qr_during_pairing_is_pending_until_verified_identity(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("app.adapters.whatsapp_web.time", SimpleNamespace(time=lambda: clock[0]))
+
+    async def run():
+        phase = "qr"
+        calls = []
+
+        def handler(request):
+            calls.append(request.method)
+            if request.url.path.endswith("/auth/qr"):
+                return httpx.Response(200, json={"value": "temporary-qr" if phase == "qr" else ""})
+            state = {"status": "SCAN_QR_CODE"} if phase != "working" else {
+                "status": "WORKING", "me": {"id": "79990000000@c.us"},
+            }
+            return httpx.Response(200, json=state)
+
+        config = {"_waha_session": SESSION}
+        shown = await auth_step(config, handler)
+        assert shown.state == "qr_required"
+        phase = "scanned"
+        pending = await auth_step(config, handler)
+        assert pending.state == "connecting"
+        assert "qr_data_url" not in pending.public and "identity" not in pending.public
+        deadline = config["_waha_wait_deadline"]
+        clock[0] += 3
+        assert (await auth_step(config, handler)).state == "connecting"
+        assert config["_waha_wait_deadline"] == deadline
+        phase = "working"
+        connected = await auth_step(config, handler)
+        assert connected.state == "connected"
+        assert connected.public["identity"]["phone"] == "+79990000000"
+        assert config["_waha_session"] == SESSION
+        assert set(calls) == {"GET"}
+
+    asyncio.run(run())
+
+
+def test_empty_qr_wait_keeps_deadline_across_worker_restarts(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("app.adapters.whatsapp_web.time", SimpleNamespace(time=lambda: clock[0]))
+
+    def handler(request):
+        return httpx.Response(200, json={"value": ""} if request.url.path.endswith("/auth/qr")
+                              else {"status": "SCAN_QR_CODE"})
+
+    async def run():
+        config = {"_waha_session": SESSION}
+        assert (await auth_step(config, handler)).state == "connecting"
+        restored = deepcopy(config)
+        clock[0] += 120
+        result = await auth_step(restored, handler)
+        assert result.state == "action_required"
+        assert result.public["error"] == "waha_connect_timeout"
+        assert "qr_data_url" not in result.public and "identity" not in result.public
+        assert restored["_waha_wait_deadline"] == config["_waha_wait_deadline"]
+
+    asyncio.run(run())
 
 
 def test_qr_authorization_error_does_not_get_mistaken_for_pending():
