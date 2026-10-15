@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -17,7 +18,105 @@ spec=importlib.util.spec_from_file_location('pairing_diagnostic',ROOT/'scripts/d
 diag=importlib.util.module_from_spec(spec);spec.loader.exec_module(diag)
 
 
+class Python310Datetime:
+    """Exercise CPython <=3.10's fractional parser even when CI uses 3.12."""
+    @staticmethod
+    def fromisoformat(value):
+        fractional=re.search(r'T\d{2}:\d{2}:\d{2}\.(\d+)',value)
+        if value.endswith('Z') or fractional and len(fractional[1]) not in {3,6}:
+            raise ValueError('Invalid isoformat string')
+        return datetime.fromisoformat(value)
+
+    @staticmethod
+    def fromtimestamp(value,tz):
+        return datetime.fromtimestamp(value,tz)
+
+
 class PairingTests(unittest.TestCase):
+    def test_normal_delayed_restart_is_not_a_transport_timeout(self):
+        report=diag.timeline(json.dumps({'time':1792058400000,'session':'session-a',
+            'msg':'Job scheduled with timeout 2000 ms','job':'start-engine'}).encode())
+        self.assertEqual(report['events'][0]['event'],'engine_restart_scheduled')
+        self.assertEqual(report['events'][0]['reason_codes'],[])
+        self.assertEqual(report['session_summaries'][0]['reason_counts'],{})
+
+    def test_compact_packet_keeps_deployment_and_per_account_failure_evidence(self):
+        lines=[];accounts=[]
+        for index in range(8):
+            session='session-'+str(index)
+            lines.append('2026-10-15T10:00:01.123456789Z '+json.dumps({
+                'session':session,'msg':'pairing configured successfully',
+                'private':'SECRET_DEVICE'}))
+            lines.append('2026-10-15T10:00:02.123456789Z '+json.dumps({
+                'session':session,'msg':'Connection closed due to WebSocket Error: timed out, reconnecting...',
+                'err':{'output':{'statusCode':408},'trace':'SECRET_TRACE'},
+                'private':'SECRET_CREDENTIAL'}))
+            accounts.append({'account_hash':format(index,'012x'),'session_hash':diag.session_hash(session),
+                'state':'action_required','public_error':'waha_session_failed',
+                'gateway':{'status':'session_found','provider_state':'FAILED'},'phone':'SECRET_PHONE'})
+        report={'diagnostic':'whatsapp_pairing_readonly_v2','result':'ok',
+                'auto_update':{'status':'up_to_date','deployed_sha':'a'*40},
+                'timeline':dict(diag.timeline('\n'.join(lines).encode()),capture_status='ok'),
+                'accounts':diag.safe_accounts(json.dumps({'result':'ok','accounts_total':8,'accounts':accounts}))}
+        compact=diag.compact_report(report)
+        encoded=json.dumps(compact,separators=(',',':'))
+        self.assertLess(len(encoded),6000)
+        self.assertNotIn('SECRET',encoded);self.assertNotIn('session-0',encoded)
+        self.assertEqual(compact['auto_update']['deployed_sha'],'a'*40)
+        self.assertEqual(len(compact['accounts']),8)
+        self.assertEqual(compact['accounts'][0]['status_codes'],[408])
+        self.assertEqual(compact['accounts'][0]['reason_counts'],{'timeout':1,'websocket_error':1})
+        self.assertEqual(compact['accounts'][0]['events']['pairing_configured'],1)
+        self.assertEqual(compact['accounts'][0]['last_event']['timestamp_utc'],'2026-10-15T10:00:02.123Z')
+
+    def test_failure_reason_attribute_is_allowlisted_without_raw_node(self):
+        report=diag.timeline(json.dumps({'time':1792058400000,'session':'session-a',
+            'msg':'connection errored','node':{'tag':'failure','attrs':{'reason':'401','credential':'SECRET'}}}).encode())
+        self.assertEqual(report['session_summaries'][0]['status_codes'],[401])
+        self.assertNotIn('SECRET',json.dumps(report))
+
+    def test_docker_timestamp_fractions_work_with_python310_parser(self):
+        with patch.object(diag,'datetime',Python310Datetime):
+            for digits in range(1,10):
+                fraction='123456789'[:digits]
+                with self.subTest(digits=digits):
+                    self.assertEqual(diag.timestamp('2026-10-15T10:00:01.'+fraction+'Z'),
+                                     '2026-10-15T10:00:01.'+fraction[:3].ljust(3,'0')+'Z')
+            for value,expected in (
+                ('2026-10-15T10:00:01Z','2026-10-15T10:00:01.000Z'),
+                ('2026-10-15T13:00:01.123456789+03:00','2026-10-15T10:00:01.123Z'),
+                ('2026-10-15T06:00:01.123456789-04:00','2026-10-15T10:00:01.123Z'),
+                ('2026-10-15T10:00:01.999999999Z','2026-10-15T10:00:01.999Z'),
+                (1792058401123,'2026-10-15T10:00:01.123Z'),
+            ):
+                with self.subTest(value=value):self.assertEqual(diag.timestamp(value),expected)
+            for value in ('2026-10-15T10:00:01.1234567890Z','2026-02-30T10:00:01.123Z',
+                          '2026-10-15T10:00:01.123Z SECRET','SECRET_DATE'):
+                with self.subTest(invalid=value):self.assertIsNone(diag.timestamp(value))
+
+    def test_python310_timestamp_parsing_preserves_pretty_and_json_correlation(self):
+        rows=[
+            '2026-10-15T10:00:01.123456789Z [10:00:01.123] ERROR (NOWEBEngine/1): session:session-a - error in validating connection',
+            '2026-10-15T10:00:01.123456790Z     err: {',
+            '2026-10-15T10:00:01.123456791Z       "code": "ECONNRESET",',
+            '2026-10-15T10:00:01.123456792Z       "output": {"statusCode": 401, "secret": "SECRET_TRACE"}',
+            '2026-10-15T10:00:01.123456793Z     }',
+            '2026-10-15T10:00:02.987654321Z '+json.dumps({'session':'session-b','msg':'stream errored out','fullErrorNode':{'attrs':{'code':'515'}},'token':'SECRET_TOKEN'}),
+        ]
+        with patch.object(diag,'datetime',Python310Datetime):
+            report=diag.timeline('\n'.join(rows).encode())
+        failure=next(event for event in report['events'] if event['event']=='connection_validation_failed')
+        self.assertEqual(failure['timestamp_utc'],'2026-10-15T10:00:01.123Z')
+        self.assertEqual(failure['session_hash'],diag.session_hash('session-a'))
+        self.assertEqual(failure['status_codes'],[401])
+        self.assertEqual(failure['error_codes'],['ECONNRESET'])
+        restart=next(event for event in report['events'] if event['event']=='stream_error')
+        self.assertEqual(restart['timestamp_utc'],'2026-10-15T10:00:02.987Z')
+        self.assertEqual(restart['session_hash'],diag.session_hash('session-b'))
+        self.assertTrue(restart['restart_required'])
+        self.assertEqual(report['events_without_timestamp'],0)
+        self.assertNotIn('SECRET',json.dumps(report))
+
     def test_pretty_multiline_error_codes_stay_with_the_correct_session(self):
         # WAHA uses pino-pretty singleLine=true, but error-like objects remain
         # multiline. Docker prefixes every physical line, including the stack.
