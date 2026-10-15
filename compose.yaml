@@ -1,0 +1,172 @@
+name: omnicrm
+
+x-app-environment: &app-environment
+  APP_ENV: production
+  DEMO_MODE: "false"
+  DATABASE_URL: ${DATABASE_URL:?Set a postgresql+psycopg DATABASE_URL in .env}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set a generated Fernet key in .env}
+  JWT_SECRET: ${JWT_SECRET:-}
+  JWT_JWKS_URL: ${JWT_JWKS_URL:-}
+  JWT_ISSUER: ${JWT_ISSUER:?Set the issuer of your CRM JWTs}
+  JWT_AUDIENCE: ${JWT_AUDIENCE:?Set the messaging service JWT audience}
+  ENABLE_EXPERIMENTAL: ${ENABLE_EXPERIMENTAL:-false}
+  WAHA_URL: ${WAHA_URL:-}
+  WAHA_API_KEY: ${WAHA_API_KEY:-}
+  NO_PROXY: ${NO_PROXY:-},localhost,127.0.0.1,waha,postgres
+  no_proxy: ${no_proxy:-${NO_PROXY:-}},localhost,127.0.0.1,waha,postgres
+  SMS_GATEWAY_URL: ${SMS_GATEWAY_URL:-}
+
+x-app: &app
+  image: omnicrm:${APP_IMAGE_TAG:-local}
+  build:
+    context: .
+  user: "10001:10001"
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:rw,nosuid,noexec,size=64m,uid=10001,gid=10001
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  environment: *app-environment
+  networks: [backend, outbound]
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a generated POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    stop_grace_period: 60s
+
+  # Initial schema creation/validation only; not an upgrade migration engine.
+  migrate:
+    <<: *app
+    command: [python, scripts/migrate.py]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+  api:
+    <<: *app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${API_PORT:-8080}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 30s
+
+  worker:
+    <<: *app
+    command: [python, -m, app.worker]
+    restart: unless-stopped
+    environment:
+      <<: *app-environment
+      WORKER_SHARD_COUNT: "16"
+      WORKER_SHARDS: ${WORKER_SHARDS:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
+      WORKER_HEARTBEAT_PATH: /tmp/omnicrm-worker.heartbeat
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # This measures loop liveness; it is not a promise of provider connectivity.
+    healthcheck:
+      test: [CMD, python, -c, "import os,time; p=os.environ['WORKER_HEARTBEAT_PATH']; assert 0 <= time.time()-os.stat(p).st_mtime < 120"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    stop_grace_period: 60s
+
+  # A one-shot filesystem initializer. The actual WAHA daemon runs as UID 1000.
+  waha-volume-init:
+    image: ${WAHA_IMAGE:-devlikeapro/waha:noweb-2026.9.2@sha256:be61f8cd7774ab22bd1b755cbc539f98d71d81d5ca83555fdddfa4fddd7924e1}
+    profiles: [waha]
+    user: "0:0"
+    entrypoint: [/bin/sh, -ec]
+    command: ["chown -R 1000:1000 /app/.sessions /app/.media"]
+    restart: "no"
+    read_only: true
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - waha-sessions:/app/.sessions
+      - waha-media:/app/.media
+
+  waha:
+    image: ${WAHA_IMAGE:-devlikeapro/waha:noweb-2026.9.2@sha256:be61f8cd7774ab22bd1b755cbc539f98d71d81d5ca83555fdddfa4fddd7924e1}
+    profiles: [waha]
+    user: "1000:1000"
+    restart: unless-stopped
+    # Guard a disabled profile without requiring its secret for the base stack.
+    command:
+      - /bin/sh
+      - -ec
+      - 'test -n "$$WAHA_API_KEY" || { echo "WAHA_API_KEY is required" >&2; exit 1; }; exec /entrypoint.sh'
+    environment:
+      WAHA_API_KEY: ${WAHA_API_KEY:-}
+      WHATSAPP_DEFAULT_ENGINE: NOWEB
+      WAHA_RUN_XVFB: "false"
+      WAHA_PRINT_QR: "false"
+      WAHA_DASHBOARD_ENABLED: "false"
+      WHATSAPP_SWAGGER_ENABLED: "false"
+      WHATSAPP_FILES_FOLDER: /app/.media
+    volumes:
+      - waha-sessions:/app/.sessions
+      - waha-media:/app/.media
+    tmpfs:
+      - /tmp:rw,nosuid,size=256m,uid=1000,gid=1000
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [outbound]
+    depends_on:
+      waha-volume-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/api/sessions',{headers:{'X-Api-Key':process.env.WAHA_API_KEY}}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+networks:
+  backend:
+    internal: true
+  outbound: {}
+
+volumes:
+  postgres-data: {}
+  waha-sessions: {}
+  waha-media: {}

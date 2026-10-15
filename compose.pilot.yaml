@@ -1,0 +1,170 @@
+name: omnicrm-pilot
+
+# Private account test for trusted SSH administrators only. Loopback is mandatory.
+# Use authenticated SSH -L bound to client loopback; never expose via a public tunnel.
+x-local-environment: &local-environment
+  APP_ENV: development
+  DEMO_MODE: "false"
+  LOCAL_TEST_MODE: "true"
+  ENABLE_EXPERIMENTAL: "true"
+  DATABASE_URL: ${DATABASE_URL:?Run scripts/server_pilot.sh first}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Missing persistent local encryption key}
+  JWT_SECRET: ${JWT_SECRET:?Missing persistent local JWT secret}
+  JWT_JWKS_URL: ""
+  JWT_ISSUER: omnicrm-local
+  JWT_AUDIENCE: omnicrm
+  WAHA_URL: http://waha:3000
+  WAHA_API_KEY: ${WAHA_API_KEY:?Missing local WAHA API key}
+  # Preserve external proxy policy; Docker service traffic stays on its network.
+  NO_PROXY: ${NO_PROXY:-},localhost,127.0.0.1,waha,postgres
+  no_proxy: ${no_proxy:-${NO_PROXY:-}},localhost,127.0.0.1,waha,postgres
+  SMS_GATEWAY_URL: ${SMS_GATEWAY_URL:-}
+
+x-local-app: &local-app
+  image: omnicrm:pilot
+  build:
+    context: .
+  user: "10001:10001"
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:rw,nosuid,noexec,size=64m,uid=10001,gid=10001
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  environment: *local-environment
+  networks: [backend, outbound]
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: omnicrm_local
+      POSTGRES_USER: omnicrm_local
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Missing local database password}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [backend]
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+    stop_grace_period: 60s
+
+  migrate:
+    <<: *local-app
+    command: [python, scripts/migrate.py]
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+
+  api:
+    <<: *local-app
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LOCAL_PORT:-18580}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health/ready',timeout=3); r=json.load(urllib.request.urlopen('http://127.0.0.1:8080/api/runtime',timeout=3)); assert r.get('local_test') is True and r.get('demo') is False"
+      interval: 10s
+      timeout: 8s
+      retries: 6
+      start_period: 20s
+    stop_grace_period: 30s
+
+  worker:
+    <<: *local-app
+    command: [python, -m, app.worker]
+    restart: unless-stopped
+    environment:
+      <<: *local-environment
+      WORKER_SHARD_COUNT: "16"
+      WORKER_SHARDS: "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+      WORKER_HEARTBEAT_PATH: /tmp/omnicrm-worker.heartbeat
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, python, -c, "import os,time; p=os.environ['WORKER_HEARTBEAT_PATH']; assert 0 <= time.time()-os.stat(p).st_mtime < 120"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    stop_grace_period: 60s
+
+  waha-volume-init:
+    image: ${WAHA_IMAGE:?Run the local initializer to select the native WAHA image}
+    user: "0:0"
+    entrypoint: [/bin/sh, -ec]
+    command: ["chown -R 1000:1000 /app/.sessions /app/.media"]
+    restart: "no"
+    read_only: true
+    network_mode: none
+    cap_drop: [ALL]
+    cap_add: [CHOWN, DAC_OVERRIDE]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - waha-sessions:/app/.sessions
+      - waha-media:/app/.media
+
+  waha:
+    image: ${WAHA_IMAGE:?Run the local initializer to select the native WAHA image}
+    user: "1000:1000"
+    restart: unless-stopped
+    environment:
+      WAHA_API_KEY: ${WAHA_API_KEY:?Missing local WAHA API key}
+      WHATSAPP_DEFAULT_ENGINE: NOWEB
+      WAHA_RUN_XVFB: "false"
+      WAHA_PRINT_QR: "false"
+      WAHA_DASHBOARD_ENABLED: "false"
+      WHATSAPP_SWAGGER_ENABLED: "false"
+      WHATSAPP_FILES_FOLDER: /app/.media
+    volumes:
+      - waha-sessions:/app/.sessions
+      - waha-media:/app/.media
+    tmpfs:
+      - /tmp:rw,nosuid,size=256m,uid=1000,gid=1000
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [outbound]
+    depends_on:
+      waha-volume-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, node, -e, "fetch('http://127.0.0.1:3000/api/sessions',{headers:{'X-Api-Key':process.env.WAHA_API_KEY}}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 45s
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+networks:
+  backend:
+    internal: true
+  outbound: {}
+
+volumes:
+  postgres-data: {}
+  waha-sessions: {}
+  waha-media: {}
