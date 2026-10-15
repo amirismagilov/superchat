@@ -57,6 +57,19 @@ class RuntimeDiagnosticTests(unittest.TestCase):
         self.assertNotIn('SECRET', json.dumps(result))
         self.assertEqual(len(result['checks']), 1)
 
+    def test_node_network_policy_only_exposes_known_settings(self):
+        result = diag.safe_probe(json.dumps({'status': 'complete', 'proxy_configured': False,
+            'dns_order': 'ipv4first', 'auto_select_family': False,
+            'NODE_OPTIONS': 'SECRET_OPTION'}), 'waha')
+        self.assertEqual(result['dns_order'], 'ipv4first')
+        self.assertIs(result['auto_select_family'], False)
+        self.assertNotIn('SECRET', json.dumps(result))
+        result = diag.safe_probe(json.dumps({'status': 'complete',
+            'dns_order': 'SECRET_VALUE', 'auto_select_family': 'SECRET_VALUE'}), 'waha')
+        self.assertEqual(result['dns_order'], 'unknown')
+        self.assertNotIn('auto_select_family', result)
+        self.assertNotIn('SECRET', json.dumps(result))
+
     def test_nested_telegram_report_is_filtered_again(self):
         output = json.dumps({'result':'ok','accounts_total':1,'environment':{'DATABASE_URL':'SECRET_DATABASE'},'worker_heartbeat':{'status':'visible','age_seconds':4,'fresh':True,'path':'SECRET_PATH'},'accounts':[{'account_hash':'123456789abc','state':'connecting','public_error':'telegram_transport_error','updated_age_seconds':10,'phone':'SECRET_PHONE','qr_text':'SECRET_QR','jobs':[{'action':'login','status':'failed','error':'SECRET_RAW_EXCEPTION','age_seconds':2,'payload':'SECRET_PASSWORD'}]}]})
         result = diag.safe_telegram(output)

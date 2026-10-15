@@ -20,8 +20,16 @@ Do not send private keys, server passwords or messenger codes in support chat.
 The updater verifies the source manifest and existing source, builds the
 candidate before stopping API/worker, creates a private PostgreSQL dump and
 applies only a known migration. It preserves `.env.pilot`, the loopback port,
-PostgreSQL/WAHA containers, volumes and local files outside the source manifest.
+PostgreSQL, provider volumes and local files outside the source manifest.
 Changed source files block an update to avoid overwriting manual modifications.
+
+Ordinary updates retain the WAHA container. One explicit migration adds IPv4-first
+DNS selection to the pinned WAHA NOWEB image. Only that exact environment change
+is permitted; the image, credentials, mounts, networks and other settings must
+match. This migration recreates WAHA with the same session and media volumes.
+Failed updates and application rollback restore its previous network options.
+Other persistent-service changes remain blocked. QR generation and messenger
+login still need a separate check after the gateway restarts.
 
 `UPDATE_OK` confirms the updater's application health checks. Real messenger
 authorization and delivery require separate account tests.

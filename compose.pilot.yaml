@@ -135,6 +135,8 @@ services:
       WAHA_DASHBOARD_ENABLED: "false"
       WHATSAPP_SWAGGER_ENABLED: "false"
       WHATSAPP_FILES_FOLDER: /app/.media
+      # Preserve the pinned image heap limit while using the verified IPv4 route.
+      NODE_OPTIONS: "--max-old-space-size=16384 --dns-result-order=ipv4first --no-network-family-autoselection"
     volumes:
       - waha-sessions:/app/.sessions
       - waha-media:/app/.media

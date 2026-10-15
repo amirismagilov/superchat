@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Update source and app containers only. Never recreate database/WAHA or remove volumes.
+# Update app containers; one reviewed pinned-WAHA IPv4 transition is allowed below.
+# Never recreate the database, change persistent volumes or delete stored data.
 set -euo pipefail
 umask 077
 target=/opt/omnicrm-pilot
@@ -24,6 +25,18 @@ else
 fi
 case "$endpoint" in unix://*) ;; *) fail 'Use the local Docker Engine on this server.' ;; esac
 compose=(env -u LOCAL_PORT -u DATABASE_URL -u ENCRYPTION_KEY -u JWT_SECRET -u WAHA_API_KEY -u POSTGRES_PASSWORD -u SMS_GATEWAY_URL -u WAHA_IMAGE docker compose --project-name omnicrm-pilot --env-file "$target/.env.pilot" -f "$target/compose.pilot.yaml")
+pinned_waha_image='devlikeapro/waha:noweb-2026.9.2@sha256:be61f8cd7774ab22bd1b755cbc539f98d71d81d5ca83555fdddfa4fddd7924e1'
+# Inspect only option-match booleans, image ID and mounts; never emit environment values.
+waha_inspect_format='{{$default := false}}{{$target := false}}{{$custom := false}}{{$proxy := false}}{{range .Config.Env}}{{$parts := split . "="}}{{$key := index $parts 0}}{{if eq $key "NODE_OPTIONS"}}{{if eq . "NODE_OPTIONS=--max-old-space-size=16384"}}{{$default = true}}{{else if eq . "NODE_OPTIONS=--max-old-space-size=16384 --dns-result-order=ipv4first --no-network-family-autoselection"}}{{$target = true}}{{else}}{{$custom = true}}{{end}}{{end}}{{if or (eq $key "WHATSAPP_PROXY_SERVER") (eq $key "WHATSAPP_PROXY_SERVER_LIST") (eq $key "WAHA_PROXY") (eq $key "HTTP_PROXY") (eq $key "HTTPS_PROXY") (eq $key "ALL_PROXY") (eq $key "http_proxy") (eq $key "https_proxy") (eq $key "all_proxy")}}{{if ne . (printf "%s=" $key)}}{{$proxy = true}}{{end}}{{end}}{{end}}{"image":{{json .Image}},"mounts":{{json .Mounts}},"node_default":{{$default}},"node_target":{{$target}},"node_custom":{{$custom}},"proxy_configured":{{$proxy}}}'
+waha_runtime() {
+  local id
+  id="$("${compose[@]}" ps --all -q waha)"
+  [ -n "$id" ] || return 1
+  docker inspect --format "$waha_inspect_format" "$id"
+}
+verify_waha_runtime() {
+  waha_runtime | python3 "$backup/control.py" waha-check "$target" "$backup/waha-runtime.json" "$1"
+}
 
 # A previous backup keeps this helper and rollback entry point outside the app tree.
 if [ "${1:-}" = --rollback ]; then
@@ -37,9 +50,16 @@ if [ "${1:-}" = --rollback ]; then
   docker image inspect "$old_image" >/dev/null || fail 'Previous image is unavailable; do not delete rollback images.'
   # Validate all source/backup paths before stopping the application.
   python3 "$backup/control.py" restore-check "$target" "$backup"
+  if [ -f "$backup/requires-waha-recreate" ]; then
+    verify_waha_runtime either
+  fi
   "${compose[@]}" stop --timeout 60 api worker
   python3 "$backup/control.py" restore "$target" "$backup"
   docker image tag "$old_image" omnicrm:pilot
+  if [ -f "$backup/requires-waha-recreate" ]; then
+    "${compose[@]}" up -d --no-deps --no-build --pull never --wait --wait-timeout 180 waha
+    verify_waha_runtime default
+  fi
   "${compose[@]}" up -d --no-deps --no-build --wait --wait-timeout 180 api worker
   printf '%s\n' 'ROLLBACK_OK — previous source/image restored; database contents and additive migrations retained.'
   bash "$target/scripts/server_pilot.sh" status
@@ -61,6 +81,7 @@ stage="$(mktemp -d /opt/omnicrm-pilot-update.stage.XXXXXXXX)"
 backup=''
 cutover=0
 source_changed=0
+waha_change_started=0
 cleanup() {
   local result=$?
   trap - EXIT INT TERM
@@ -71,6 +92,12 @@ cleanup() {
       python3 "$backup/control.py" restore "$target" "$backup" || recovered=0
     fi
     docker image tag "$old_image" omnicrm:pilot || recovered=0
+    if [ "$recovered" = 1 ] && [ "$waha_change_started" = 1 ]; then
+      "${compose[@]}" up -d --no-deps --no-build --pull never --wait --wait-timeout 180 waha || recovered=0
+      if [ "$recovered" = 1 ]; then
+        verify_waha_runtime default || recovered=0
+      fi
+    fi
     if [ "$recovered" = 1 ]; then
       "${compose[@]}" up -d --no-deps --no-build --wait --wait-timeout 180 api worker || recovered=0
     fi
@@ -94,9 +121,48 @@ from pathlib import Path, PurePosixPath
 TOP = {'.dockerignore', '.gitignore', 'Dockerfile', 'LICENSE', 'README.md', 'Start.command', 'Stop.command', 'requirements.in', 'requirements.lock', 'compose.yaml', 'compose.local.yaml', 'compose.pilot.yaml'}
 PREFIX = {'app', 'web', 'scripts', 'docs', 'tests'}
 MANIFEST = 'docs/source-manifest.json'
+PINNED_WAHA_IMAGE = 'devlikeapro/waha:noweb-2026.9.2@sha256:be61f8cd7774ab22bd1b755cbc539f98d71d81d5ca83555fdddfa4fddd7924e1'
+WAHA_IPV4_OPTIONS = '--max-old-space-size=16384 --dns-result-order=ipv4first --no-network-family-autoselection'
 
 def fail(message):
     raise SystemExit(message)
+
+def waha_ipv4_transition(old, new):
+    if old.get('image') != PINNED_WAHA_IMAGE or new.get('image') != PINNED_WAHA_IMAGE:
+        return False
+    before, after = old.get('environment'), new.get('environment')
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    if 'NODE_OPTIONS' in before or after.get('NODE_OPTIONS') != WAHA_IPV4_OPTIONS:
+        return False
+    stripped = dict(after)
+    stripped.pop('NODE_OPTIONS')
+    return old == {**new, 'environment': stripped}
+
+def waha_snapshot(value, options):
+    if not isinstance(value, dict) or not re.fullmatch(r'sha256:[a-f0-9]{64}', str(value.get('image', ''))):
+        fail('WAHA runtime image identity is invalid.')
+    if value.get('proxy_configured') is not False or value.get('node_custom') is not False:
+        fail('WAHA has custom runtime options or proxy routing; inspect before this targeted repair.')
+    default, target = value.get('node_default') is True, value.get('node_target') is True
+    if default == target or (options == 'default' and not default) or (options == 'target' and not target):
+        fail('WAHA runtime NODE_OPTIONS does not match the reviewed transition.')
+    mounts = value.get('mounts')
+    if not isinstance(mounts, list):
+        fail('WAHA runtime mounts are unavailable.')
+    volumes = []
+    for mount in mounts:
+        if not isinstance(mount, dict) or mount.get('Type') not in {'volume', 'tmpfs'}:
+            fail('Unexpected WAHA runtime mount type.')
+        if mount['Type'] == 'volume':
+            volumes.append({key: mount.get(key) for key in ('Name', 'Destination', 'RW')})
+    expected = [
+        {'Name': 'omnicrm-pilot_waha-media', 'Destination': '/app/.media', 'RW': True},
+        {'Name': 'omnicrm-pilot_waha-sessions', 'Destination': '/app/.sessions', 'RW': True},
+    ]
+    if sorted(volumes, key=lambda item: str(item['Name'])) != expected:
+        fail('WAHA persistent volumes differ from the existing private pilot.')
+    return {'image': value['image'], 'volumes': expected}
 
 def safe(name):
     if not isinstance(name, str) or not re.fullmatch(r'[A-Za-z0-9_./-]+', name):
@@ -227,12 +293,16 @@ if operation == 'extract':
     print('Archive paths, SHA-256 manifest and unmodified installed source validated.')
 elif operation == 'config':
     old, new = (json.loads(Path(p).read_text()) for p in sys.argv[3:5])
+    recreate_waha = False
     for field in ('name', 'volumes', 'networks'):
         if old.get(field) != new.get(field):
             fail('Update would change persistent Docker infrastructure: ' + field)
     for name in ('postgres', 'waha', 'waha-volume-init'):
         if old['services'][name] != new['services'][name]:
-            fail('Update would change a persistent service: ' + name)
+            if name == 'waha' and waha_ipv4_transition(old['services'][name], new['services'][name]):
+                recreate_waha = True
+            else:
+                fail('Update would change a persistent service: ' + name)
     if old['services']['api']['ports'] != new['services']['api']['ports']:
         fail('Update would change the saved API port')
     ports = new['services']['api']['ports']
@@ -247,7 +317,25 @@ elif operation == 'config':
             fail('Update is not the private pilot profile')
         if new['services'][name]['image'] != 'omnicrm:pilot':
             fail('Unexpected application image name')
-    print('Saved API port, credentials and persistent services are unchanged.')
+    if recreate_waha and len(sys.argv) < 6:
+        fail('Targeted WAHA recreation requires an explicit update plan.')
+    if len(sys.argv) >= 6:
+        Path(sys.argv[5]).write_text('1' if recreate_waha else '0')
+    print('Saved API port, credentials, PostgreSQL and persistent volumes are unchanged.')
+    if recreate_waha:
+        print('One pinned-WAHA IPv4 settings transition requires a targeted gateway recreation.')
+elif operation in ('waha-save', 'waha-check'):
+    destination = Path(sys.argv[3])
+    options = 'default' if operation == 'waha-save' else sys.argv[4]
+    if options not in {'default', 'target', 'either'}:
+        fail('Unknown WAHA snapshot validation mode.')
+    snapshot = waha_snapshot(json.load(sys.stdin), options)
+    if operation == 'waha-save':
+        if snapshot['image'] != sys.argv[4]:
+            fail('Running WAHA image differs from the approved pinned image.')
+        destination.write_text(json.dumps(snapshot, sort_keys=True))
+    elif json.loads(destination.read_text()) != snapshot:
+        fail('WAHA image or persistent volume identity changed unexpectedly.')
 elif operation == 'backup':
     stage, backup = Path(sys.argv[3]), Path(sys.argv[4])
     old, new = load_source(root), load_source(stage)
@@ -281,7 +369,9 @@ python3 "$stage/control.py" extract "$target" "$archive" "$stage"
 new_compose=(env -u LOCAL_PORT -u DATABASE_URL -u ENCRYPTION_KEY -u JWT_SECRET -u WAHA_API_KEY -u POSTGRES_PASSWORD -u SMS_GATEWAY_URL -u WAHA_IMAGE docker compose --project-name omnicrm-pilot --env-file "$target/.env.pilot" -f "$stage/compose.pilot.yaml")
 "${compose[@]}" config --format json > "$stage/old-config.json"
 "${new_compose[@]}" config --format json > "$stage/new-config.json"
-python3 "$stage/control.py" config "$target" "$stage/old-config.json" "$stage/new-config.json"
+python3 "$stage/control.py" config "$target" "$stage/old-config.json" "$stage/new-config.json" "$stage/waha-plan"
+requires_waha_recreate="$(cat "$stage/waha-plan")"
+case "$requires_waha_recreate" in 0|1) ;; *) fail 'Invalid WAHA update plan.' ;; esac
 # Resolved Compose JSON contains credentials; remove it before copying source/creating backups.
 rm -- "$stage/old-config.json" "$stage/new-config.json"
 api_id="$("${compose[@]}" ps -q api)"
@@ -289,6 +379,10 @@ worker_id="$("${compose[@]}" ps -q worker)"
 postgres_id="$("${compose[@]}" ps -q postgres)"
 waha_id="$("${compose[@]}" ps -q waha)"
 [ -n "$api_id" ] && [ -n "$worker_id" ] && [ -n "$postgres_id" ] && [ -n "$waha_id" ] || fail 'Existing API, worker, PostgreSQL and WAHA must be running before an update.'
+if [ "$requires_waha_recreate" = 1 ]; then
+  expected_waha_image="$(docker image inspect --format '{{.Id}}' "$pinned_waha_image")"
+  waha_runtime | python3 "$stage/control.py" waha-save "$target" "$stage/waha-runtime.json" "$expected_waha_image"
+fi
 old_image="$(docker inspect --format '{{.Image}}' "$api_id")"
 [ "$(docker inspect --format '{{.Image}}' "$worker_id")" = "$old_image" ] || fail 'API and worker use different images; inspect the existing deployment first.'
 env_digest="$(sha256sum "$target/.env.pilot" | awk '{print $1}')"
@@ -309,6 +403,10 @@ mkdir -m 700 "$backup"
 python3 "$stage/control.py" backup "$target" "$stage" "$backup"
 cp "$stage/control.py" "$backup/control.py"
 cp "$stage/scripts/update_server_pilot.sh" "$backup/updater.sh"
+if [ "$requires_waha_recreate" = 1 ]; then
+  cp "$stage/waha-runtime.json" "$backup/waha-runtime.json"
+  printf '%s\n' 'pinned-noweb-2026.9.2-ipv4-v1' > "$backup/requires-waha-recreate"
+fi
 printf '%s\n' "$old_image" > "$backup/old-image-id"
 docker image tag "$old_image" "omnicrm:pilot-rollback-$release"
 printf '%s\n' "$candidate" > "$backup/new-image-tag"
@@ -331,10 +429,21 @@ printf '{"services":{"migrate":{"image":"%s"}}}\n' "$candidate" > "$stage/candid
 source_changed=1
 python3 "$stage/control.py" install "$target" "$stage" "$backup"
 docker image tag "$candidate" omnicrm:pilot
+if [ "$requires_waha_recreate" = 1 ]; then
+  printf '\nApplying the reviewed pinned-WAHA IPv4 settings; image and session volumes are retained.\n'
+  waha_change_started=1
+  "${compose[@]}" up -d --no-deps --no-build --pull never --wait --wait-timeout 180 waha
+  verify_waha_runtime target
+fi
 "${compose[@]}" up -d --no-deps --no-build --wait --wait-timeout 180 api worker
 [ "$(sha256sum "$target/.env.pilot" | awk '{print $1}')" = "$env_digest" ] || fail 'Persistent credentials unexpectedly changed; inspect before proceeding.'
 [ "$("${compose[@]}" ps -q postgres)" = "$postgres_id" ] || fail 'PostgreSQL container changed unexpectedly.'
-[ "$("${compose[@]}" ps -q waha)" = "$waha_id" ] || fail 'WAHA container changed unexpectedly.'
+if [ "$requires_waha_recreate" = 1 ]; then
+  [ "$("${compose[@]}" ps -q waha)" != "$waha_id" ] || fail 'WAHA targeted recreation did not replace the original container.'
+  verify_waha_runtime target
+else
+  [ "$("${compose[@]}" ps -q waha)" = "$waha_id" ] || fail 'WAHA container changed unexpectedly.'
+fi
 bash "$target/scripts/server_pilot.sh" status
 cutover=0
 printf '\nUPDATE_OK — account data, keys, sessions and the saved port are preserved.\n'

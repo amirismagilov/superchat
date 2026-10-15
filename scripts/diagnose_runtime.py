@@ -142,7 +142,7 @@ def classify_logs(data):
 
 
 NODE_PROBE = r'''
-const dns=require('dns'), https=require('https');
+const dns=require('dns'), https=require('https'), net=require('net');
 const allowed=new Set(['ENOTFOUND','EAI_AGAIN','ETIMEDOUT','ECONNRESET','ECONNREFUSED','EHOSTUNREACH','ENETUNREACH','EPIPE','CERT_HAS_EXPIRED','UNABLE_TO_VERIFY_LEAF_SIGNATURE','SELF_SIGNED_CERT_IN_CHAIN','DEPTH_ZERO_SELF_SIGNED_CERT','ERR_TLS_CERT_ALTNAME_INVALID','UNABLE_TO_GET_ISSUER_CERT_LOCALLY','ERR_TLS_HANDSHAKE_TIMEOUT']);
 const code=e=>allowed.has(e&&e.code)?e.code:'other';
 const proxy=['WHATSAPP_PROXY_SERVER','HTTPS_PROXY','HTTP_PROXY','ALL_PROXY','https_proxy','http_proxy','all_proxy'].some(k=>!!process.env[k]);
@@ -152,7 +152,7 @@ const globalTimer=setTimeout(()=>emit({status:'probe_timeout',proxy_configured:f
 function lookup(){return new Promise(resolve=>{let done=false;const finish=x=>{if(done)return;done=true;clearTimeout(timer);resolve(x)};const timer=setTimeout(()=>finish({status:'timeout'}),6000);dns.lookup('web.whatsapp.com',{all:true},(e,a)=>finish(e?{status:'failed',error_code:code(e)}:{status:'resolved',ipv4_records:a.filter(x=>x.family===4).length,ipv6_records:a.filter(x=>x.family===6).length}));})}
 function http(family){return new Promise(resolve=>{let done=false,req;const finish=x=>{if(done)return;done=true;clearTimeout(timer);resolve(x)};const timer=setTimeout(()=>{finish({status:'timeout'});if(req)req.destroy()},6500);try{req=https.get('https://web.whatsapp.com/',{family,agent:false,rejectUnauthorized:true,headers:{'User-Agent':'OmniCRM-readonly-connectivity-check'}},res=>{finish({status:'responded',http_status:res.statusCode,tls_authorized:res.socket.authorized===true});res.destroy()});req.on('error',e=>finish({status:'failed',error_code:code(e)}))}catch(e){finish({status:'failed',error_code:code(e)})}})}
 function ws(family){return new Promise(resolve=>{let WebSocket;try{WebSocket=require('ws')}catch(e){resolve({status:'module_unavailable'});return}let done=false,socket;const finish=x=>{if(done)return;done=true;clearTimeout(timer);resolve(x)};const timer=setTimeout(()=>{finish({status:'timeout'});if(socket)socket.terminate()},6500);try{socket=new WebSocket('wss://web.whatsapp.com/ws/chat',{origin:'https://web.whatsapp.com',family,handshakeTimeout:6000,rejectUnauthorized:true});socket.on('open',()=>{finish({status:'opened'});socket.terminate()});socket.on('unexpected-response',(_,r)=>{finish({status:'http_rejected',http_status:r.statusCode});r.destroy();socket.terminate()});socket.on('error',e=>finish({status:'failed',error_code:code(e)}));socket.on('close',()=>finish({status:'closed_before_open'}))}catch(e){finish({status:'failed',error_code:code(e)})}})}
-Promise.all([lookup(),http(0),http(4),ws(0),ws(4)]).then(([dns,https_default,https_ipv4,wss_default,wss_ipv4])=>{clearTimeout(globalTimer);emit({status:'complete',proxy_configured:false,dns,https_default,https_ipv4,wss_default,wss_ipv4})}).catch(()=>emit({status:'probe_failed',proxy_configured:false}));
+Promise.all([lookup(),http(0),http(4),ws(0),ws(4)]).then(([records,https_default,https_ipv4,wss_default,wss_ipv4])=>{clearTimeout(globalTimer);emit({status:'complete',proxy_configured:false,dns_order:dns.getDefaultResultOrder(),auto_select_family:net.getDefaultAutoSelectFamily(),dns:records,https_default,https_ipv4,wss_default,wss_ipv4})}).catch(()=>emit({status:'probe_failed',proxy_configured:false}));
 }
 '''
 
@@ -192,6 +192,8 @@ def safe_probe(output, kind):
             if type(value.get('tls_authorized')) is bool:clean['tls_authorized'] = value['tls_authorized']
             return clean
         if kind == 'waha':
+            if 'dns_order' in data:result['dns_order'] = enum(data['dns_order'], {'ipv4first', 'ipv6first', 'verbatim'})
+            if type(data.get('auto_select_family')) is bool:result['auto_select_family'] = data['auto_select_family']
             for key in ('dns', 'https_default', 'https_ipv4', 'wss_default', 'wss_ipv4'):
                 if key in data:result[key] = item(data[key])
         elif isinstance(data.get('checks'), list):
