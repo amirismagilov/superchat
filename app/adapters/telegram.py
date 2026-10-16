@@ -1,8 +1,8 @@
 """Corporate Telegram user accounts over MTProto (Telethon, MIT).
 
 There is no in-memory event queue: Telegram's durable difference cursor is kept
-in encrypted account config and committed by the worker with the events. Only
-ordinary one-to-one cloud chats are supported. Never log this config.
+in encrypted account config and committed by the worker with the events. Cloud dialogs, including groups, channels, bots and Saved Messages, are imported.
+Secret chats are not exposed by this protocol. Never log this config.
 """
 from __future__ import annotations
 
@@ -19,10 +19,10 @@ import time
 from typing import Any
 from uuid import UUID
 
-from telethon import TelegramClient, errors, functions, types
+from telethon import TelegramClient, errors, functions, types, utils
 from telethon.sessions import StringSession
 
-from .base import Adapter, AuthResult, Event, ProviderError
+from .base import Adapter, AuthResult, Event, ProviderError, history_days
 
 
 REVOKED_KEYS = (errors.AuthKeyUnregisteredError, errors.AuthKeyInvalidError,
@@ -139,7 +139,7 @@ class TelegramAdapter(Adapter):
             raise ProviderError("telegram_account_identity_changed")
         self.config["telegram_bound_user_id"] = me.id
         if self.config.get("tg_self_id") != me.id:
-            for key in ("tg_cursor", "tg_entities", "tg_aliases", "tg_sync"):
+            for key in ("tg_cursor", "tg_entities", "tg_aliases", "tg_sync", "tg_history", "tg_catalog", "tg_live_channels"):
                 self.config.pop(key, None)
         self.config["tg_self_id"] = me.id
         self.config.pop("tg_code_hash", None)
@@ -159,7 +159,8 @@ class TelegramAdapter(Adapter):
         if not self.config.get("tg_cursor"):
             self.config["tg_cursor"] = self._state(
                 await self.client(functions.updates.GetStateRequest()))
-        return AuthResult("connected", {"user_id": str(me.id), "identity": identity, "history_import": "explicit_sync"})
+        self._history(self.config)
+        return AuthResult("connected", {"user_id": str(me.id), "identity": identity, "history_import": "progressive"})
 
     async def _qr_login(self, *, reset=False) -> AuthResult:
         """Durable MTProto QR login, without an in-memory update waiter.
@@ -297,36 +298,50 @@ class TelegramAdapter(Adapter):
 
     def _cache_users(self, users: list, config: dict) -> None:
         cache = config.setdefault("tg_entities", {})
-        for user in users:
-            if not isinstance(user, types.User):
+        for entity in users:
+            if not isinstance(entity, (types.User, types.Chat, types.Channel)):
                 continue
-            key = str(user.id)
+            key = str(utils.get_peer_id(entity))
             previous = cache.get(key, {})
-            # Minimal entities may carry access_hash=0 that cannot address a user.
             access_hash = previous.get("hash")
-            if user.access_hash is not None and not user.min:
-                access_hash = user.access_hash
-            cache[key] = {
-                "hash": access_hash, "bot": bool(user.bot),
-                "name": " ".join(filter(None, [user.first_name, user.last_name])) or key,
-                "username": user.username,
-            }
+            if getattr(entity, "access_hash", None) is not None and not getattr(entity, "min", False):
+                access_hash = entity.access_hash
+            if isinstance(entity, types.User):
+                name = " ".join(filter(None, [entity.first_name, entity.last_name])) or key
+                if entity.id == config.get("tg_self_id"):
+                    name = "Избранное"
+                kind = "user"
+            else:
+                name, kind = entity.title, "channel" if isinstance(entity, types.Channel) else "chat"
+            cache[key] = {"hash": access_hash, "bot": bool(getattr(entity, "bot", False)),
+                          "name": name, "username": getattr(entity, "username", None), "kind": kind}
+
+    @staticmethod
+    def _input_peer(peer: str, cached: dict):
+        real_id, peer_type = utils.resolve_id(int(peer))
+        if peer_type is types.PeerChat:
+            return types.InputPeerChat(real_id)
+        if cached.get("hash") is None:
+            raise ProviderError("telegram_peer_unknown_use_username_or_sync")
+        if peer_type is types.PeerChannel:
+            return types.InputPeerChannel(real_id, cached["hash"])
+        return types.InputPeerUser(real_id, cached["hash"])
 
     async def _resolve_peer(self, peer: str) -> types.InputPeerUser:
         peer = peer.strip()
         # Resolve username every time: usernames can change owners.
-        if peer.isdecimal():
+        if re.fullmatch(r"-?[0-9]+", peer):
             user_id = int(peer)
             cached = self.config.get("tg_entities", {}).get(str(user_id))
-            if not cached or cached.get("hash") is None:
+            if not cached or (cached.get("hash") is None and cached.get("kind") != "chat"):
                 dialogs = await self.client.get_dialogs(limit=200)
                 self._cache_users([d.entity for d in dialogs], self.config)
                 cached = self.config.get("tg_entities", {}).get(str(user_id))
-            if not cached or cached.get("hash") is None:
+            if not cached or (cached.get("hash") is None and cached.get("kind") != "chat"):
                 raise ProviderError("telegram_peer_unknown_use_username_or_sync")
-            if cached.get("bot") or user_id in (self.config.get("tg_self_id"), 777000):
+            if user_id == 777000:
                 raise ProviderError("telegram_personal_peer_required")
-            return types.InputPeerUser(user_id, cached["hash"])
+            return self._input_peer(peer, cached)
         if not re.fullmatch(r"@?[A-Za-z][A-Za-z0-9_]{3,31}|\+[1-9][0-9]{7,14}", peer):
             raise ProviderError("telegram_peer_invalid")
         if peer.startswith("+"):
@@ -389,27 +404,20 @@ class TelegramAdapter(Adapter):
             for update in getattr(result, "updates", []):
                 if isinstance(update, types.UpdateMessageID) and update.random_id == nonce:
                     return str(update.id)
-                if isinstance(update, types.UpdateNewMessage):
+                if isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage)):
                     msg = update.message
-                    if (getattr(msg, "out", False) and isinstance(msg.peer_id, types.PeerUser)
-                            and msg.peer_id.user_id == entity.user_id):
+                    if (getattr(msg, "out", False)
+                            and utils.get_peer_id(msg.peer_id) == utils.get_peer_id(entity)):
                         return str(msg.id)
             raise ProviderError("telegram_send_result_unknown", uncertain=True)
 
     def _event(self, msg: Any, config: dict) -> Event | None:
-        if not isinstance(msg, types.Message) or not isinstance(msg.peer_id, types.PeerUser):
+        if not isinstance(msg, types.Message) or not isinstance(msg.peer_id, (types.PeerUser, types.PeerChat, types.PeerChannel)):
             return None
-        user_id = msg.peer_id.user_id
-        if user_id == config.get("tg_self_id") and not msg.out:
-            if not isinstance(msg.from_id, types.PeerUser):
-                return None
-            user_id = msg.from_id.user_id
-        if user_id in (config.get("tg_self_id"), 777000):
-            return None
-        peer = str(user_id)
+        peer = str(utils.get_peer_id(msg.peer_id))
+        if peer == "777000":
+            return None  # Telegram's login-code service is not a customer conversation.
         cached = config.get("tg_entities", {}).get(peer, {})
-        if cached.get("bot"):
-            return None
         has_media = msg.media is not None and not isinstance(msg.media, types.MessageMediaEmpty)
         content = msg.message or ("[Вложение: откройте Telegram]" if has_media else "")
         if not content:
@@ -423,53 +431,207 @@ class TelegramAdapter(Adapter):
                       "media_not_downloaded": has_media},
         )
 
+    def _history(self, config: dict) -> dict:
+        if "tg_history" not in config:
+            config["tg_history"] = {"days": history_days(config, 30), "boundary": time.time(),
+                                    "folder": 0, "discovery_done": False, "offset": 0, "chats": {}}
+        return config["tg_history"]
+
+    async def request_history(self, payload: dict) -> AuthResult:
+        days = history_days(payload)
+        self.config["tg_history"] = {"days": days, "boundary": time.time(), "folder": 0,
+                                     "discovery_done": False, "offset": 0, "chats": {}}
+        self.config.pop("tg_sync", None)
+        self.config["tg_history_recover_gap"] = True
+        self._history_status(self.config)
+        return AuthResult("connected")
+
+    def _history_status(self, config: dict) -> None:
+        history = self._history(config)
+        complete = sum(bool(value.get("done")) for value in history["chats"].values())
+        count = len(config.get("tg_catalog", {}))
+        done = history["discovery_done"] and complete >= count
+        config["history_status"] = {"state": "partial" if history.get("error") else "complete" if done else "importing",
+                                    "chats_discovered": count, "chats_completed": complete,
+                                    "history_days": history["days"]}
+        if history.get("error"):
+            config["history_status"]["reason"] = "history_fetch_failed"
+
+    async def _discover(self, staged: dict, events: list) -> None:
+        history = self._history(staged)
+        catalog = staged.setdefault("tg_catalog", {})
+        # A completed scan is periodically refreshed to discover new/empty chats
+        # and changed provider titles without restarting old-message cursors.
+        if history["discovery_done"]:
+            if time.time() < history.get("refresh_after", 0):
+                return
+            history.update(folder=0, discovery_done=False)
+            history.pop("dialog_offset", None)
+        options = {"limit": 50, "folder": history["folder"]}
+        offset = history.get("dialog_offset")
+        if offset:
+            options.update(offset_id=offset["id"],
+                           offset_date=datetime.fromtimestamp(offset["date"], timezone.utc) if offset["date"] else None,
+                           offset_peer=self._input_peer(offset["peer"], staged["tg_entities"][offset["peer"]]),
+                           ignore_pinned=True)
+        async with asyncio.timeout(6):
+            dialogs = await self.client.get_dialogs(**options)
+        self._cache_users([dialog.entity for dialog in dialogs], staged)
+        for dialog in dialogs:
+            entity = dialog.entity
+            if not isinstance(entity, (types.User, types.Chat, types.Channel)) or getattr(entity, "id", None) == 777000:
+                continue
+            peer = str(utils.get_peer_id(entity))
+            cached = staged["tg_entities"][peer]
+            name = cached["name"]
+            if peer not in catalog or catalog[peer].get("name") != name:
+                events.append(Event("", peer, "", peer_name=name, metadata={"conversation_only": True,
+                    "canonical_peer": peer, "aliases": staged.get("tg_aliases", {}).get(peer, [])}))
+            catalog[peer] = {"name": name}
+            history["chats"].setdefault(peer, {"before": 0, "snapshot": int(time.time()) + 1, "done": False})
+            if isinstance(entity, types.Channel):
+                staged.setdefault("tg_live_channels", {}).setdefault(peer, int(getattr(getattr(dialog, "message", None), "id", 0)))
+        if len(dialogs) < 50:
+            history.pop("dialog_offset", None)
+            if history["folder"] == 0:
+                history["folder"] = 1  # Archived dialogs have their own pagination.
+            else:
+                history.update(discovery_done=True, refresh_after=time.time() + 60)
+        elif dialogs:
+            last = dialogs[-1]
+            message = getattr(last, "message", None)
+            date = getattr(message, "date", None)
+            next_offset = {"peer": str(utils.get_peer_id(last.entity)), "id": int(getattr(message, "id", 0)),
+                           "date": date.timestamp() if date else 0}
+            if next_offset == offset:
+                raise ProviderError("telegram_history_pagination_stalled")
+            history["dialog_offset"] = next_offset
+
+    async def _backfill(self, staged: dict, events: list) -> None:
+        history = self._history(staged)
+        peers = sorted(history["chats"])
+        if not peers:
+            return
+        offset = history["offset"] % len(peers)
+        # Scan all known peers for the next incomplete chat, but fetch just one
+        # bounded page. A large dialog never holds the discovery/live cursor.
+        ordered = peers[offset:] + peers[:offset]
+        peer = next((key for key in ordered if not history["chats"][key].get("done")), None)
+        if peer is None:
+            return
+        history["offset"] = (peers.index(peer) + 1) % len(peers)
+        progress = history["chats"][peer]
+        entity = self._input_peer(peer, staged["tg_entities"].get(peer, {}))
+        async with asyncio.timeout(6):
+            messages = await self.client.get_messages(entity, limit=100, offset_id=progress["before"],
+                offset_date=datetime.fromtimestamp(progress["snapshot"], timezone.utc))
+        floor = history["boundary"] - history["days"] * 86400
+        for message in messages:
+            event = self._event(message, staged)
+            if event and (event.timestamp or 0) >= floor:
+                event.metadata["historical"] = (event.timestamp or 0) <= history["boundary"]
+                events.append(event)
+        valid_ids = [message.id for message in messages if getattr(message, "id", 0) > 0]
+        dates = [message.date.timestamp() for message in messages if getattr(message, "date", None)]
+        if len(messages) < 100 or (dates and min(dates) < floor):
+            progress["done"] = True
+        elif valid_ids and (not progress["before"] or min(valid_ids) < progress["before"]):
+            progress["before"] = min(valid_ids)
+        else:
+            raise ProviderError("telegram_history_pagination_stalled")
+
+    async def _channel_live(self, staged: dict, events: list) -> None:
+        channels = staged.get("tg_live_channels", {})
+        if not channels:
+            return
+        peers = sorted(channels)
+        offset = int(staged.get("tg_channel_offset", 0)) % len(peers)
+        peer = peers[offset]
+        staged["tg_channel_offset"] = (offset + 1) % len(peers)
+        async with asyncio.timeout(6):
+            messages = await self.client.get_messages(self._input_peer(peer, staged["tg_entities"].get(peer, {})),
+                                                      min_id=channels[peer], reverse=True, limit=100)
+        for message in messages:
+            event = self._event(message, staged)
+            if event:
+                event.metadata["historical"] = (event.timestamp or 0) <= self._history(staged)["boundary"]
+                events.append(event)
+            if getattr(message, "id", 0) > channels[peer]:
+                channels[peer] = message.id
+
     async def poll(self) -> list[Event]:
         async with self._errors():
             await self._ready()
             if not self.config.get("tg_self_id"):
                 await self._connected()
             staged = deepcopy(self.config)
+            history = self._history(staged)
+            history.pop("error", None)
             if not staged.get("tg_cursor"):
-                staged["tg_cursor"] = self._state(
-                    await self.client(functions.updates.GetStateRequest()))
+                staged["tg_cursor"] = self._state(await self.client(functions.updates.GetStateRequest()))
             cursor = staged["tg_cursor"]
-            difference = await self.client(functions.updates.GetDifferenceRequest(
-                pts=cursor["pts"], qts=cursor["qts"],
-                date=datetime.fromtimestamp(cursor["date"], timezone.utc),
-                pts_limit=100, qts_limit=100,
-            ))
+            async with asyncio.timeout(8):
+                difference = await self.client(functions.updates.GetDifferenceRequest(
+                    pts=cursor["pts"], qts=cursor["qts"],
+                    date=datetime.fromtimestamp(cursor["date"], timezone.utc), pts_limit=100, qts_limit=100))
             events = []
+            recover_gap = staged.pop("tg_history_recover_gap", False)
+            recovered = False
             if isinstance(difference, types.updates.DifferenceTooLong):
-                # Retain old cursor: an explicit bounded recovery is required.
-                raise ProviderError("telegram_history_gap_sync_required")
-            if isinstance(difference, types.updates.DifferenceEmpty):
-                cursor["date"] = difference.date.timestamp()
-                cursor["seq"] = difference.seq
+                if not recover_gap:
+                    raise ProviderError("telegram_history_gap_sync_required")
+                # Explicit history action authorizes bounded recovery. Capture
+                # the new live baseline BEFORE discovering/backfilling dialogs,
+                # whose snapshots then overlap it. Commit both plans atomically.
+                async with asyncio.timeout(4):
+                    fresh_state = await self.client(functions.updates.GetStateRequest())
+                staged["tg_cursor"] = self._state(fresh_state)
+                history["recovered_gap"] = True
+                recovered = True
+            elif isinstance(difference, types.updates.DifferenceEmpty):
+                cursor["date"], cursor["seq"] = difference.date.timestamp(), difference.seq
             elif isinstance(difference, (types.updates.Difference, types.updates.DifferenceSlice)):
-                self._cache_users(difference.users, staged)
-                events.extend(filter(None, (self._event(m, staged) for m in difference.new_messages)))
-                state = (difference.intermediate_state if isinstance(difference, types.updates.DifferenceSlice)
-                         else difference.state)
+                self._cache_users([*difference.users, *difference.chats], staged)
+                messages = list(difference.new_messages)
+                messages.extend(update.message for update in difference.other_updates
+                    if isinstance(update, (types.UpdateNewMessage, types.UpdateNewChannelMessage)))
+                for message in messages:
+                    event = self._event(message, staged)
+                    if event:
+                        event.metadata["historical"] = (event.timestamp or 0) <= history["boundary"]
+                        events.append(event)
+                state = difference.intermediate_state if isinstance(difference, types.updates.DifferenceSlice) else difference.state
                 staged["tg_cursor"] = self._state(state)
             else:
                 raise ProviderError("telegram_difference_unknown")
+            # Errors in one history source must not roll back unrelated incoming
+            # messages or the durable live difference cursor.
+            operations = (self._discover, self._backfill) if recovered else (self._discover, self._backfill, self._channel_live)
+            for operation in operations:
+                try:
+                    await operation(staged, events)
+                except (ProviderError, errors.RPCError, OSError, ValueError, TypeError, asyncio.TimeoutError):
+                    history["error"] = True
+            # Retain legacy explicitly queued bounded syncs during upgrades.
             if staged.get("tg_sync"):
                 peer = staged["tg_sync"][0]
-                cached = staged.get("tg_entities", {}).get(peer, {})
-                if cached.get("hash") is None:
-                    raise ProviderError("telegram_peer_unknown_use_username_or_sync")
-                history = await self.client.get_messages(
-                    types.InputPeerUser(int(peer), cached["hash"]),
-                    limit=staged.get("tg_sync_limit", 50),
-                )
-                events.extend(filter(None, (self._event(m, staged) for m in history)))
-                staged["tg_sync"].pop(0)
-            # The core must commit these mutations and events in ONE transaction,
-            # and reconstruct the adapter from durable config after any rollback.
+                try:
+                    async with asyncio.timeout(3):
+                        messages = await self.client.get_messages(self._input_peer(peer, staged["tg_entities"].get(peer, {})),
+                                                                  limit=staged.get("tg_sync_limit", 50))
+                    for message in messages:
+                        event = self._event(message, staged)
+                        if event:
+                            event.metadata["historical"] = True
+                            events.append(event)
+                    staged["tg_sync"].pop(0)
+                except (ProviderError, errors.RPCError, OSError, asyncio.TimeoutError):
+                    history["error"] = True
+            self._history_status(staged)
             self.config.clear()
             self.config.update(staged)
-            unique = {event.provider_id: event for event in events}
-            return sorted(unique.values(), key=lambda event: (event.timestamp or 0, int(event.provider_id)))
+            unique = {(event.peer, event.provider_id, bool(event.metadata.get("conversation_only"))): event for event in events}
+            return sorted(unique.values(), key=lambda event: (event.timestamp or 0, int(event.provider_id or 0)))
 
     async def close(self) -> None:
         if self.client is not None:

@@ -1,6 +1,6 @@
 # Проверки и выпуск архива исходников
 
-Workflow `.github/workflows/ci.yml` запускает job `test` для push в `main`,
+Workflow `.github/workflows/ci.yml` запускает job `test` для push в `main` и `fix/mac-local-start`,
 pull request в `main` и ручного `workflow_dispatch`. Доступ GitHub token —
 `contents: read`; checkout не сохраняет credentials. Workflow не использует
 секреты мессенджеров, SSH-доступ или `pull_request_target` и сам не развёртывает
@@ -11,11 +11,14 @@ pull request в `main` и ручного `workflow_dispatch`. Доступ GitHu
 1. Python 3.12 и зависимости из `requirements.lock`; весь `pytest`.
 2. Настоящий PostgreSQL 16 в одноразовом CI service. Fencing-тест проверяет
    ожидание транзакции при смене воркера и отказ устаревшему владельцу.
+   Также проверяются миграция 0002 → 0003, поиск названий на кириллице и
+   отметка прочтения при поступлении новых сообщений.
    JUnit-отчёт дополнительно проверяется, чтобы этот тест не оказался skipped.
 3. `tests/update_pilot_smoke.py`: обновление и откат с имитацией Docker,
    сохранение данных, отказ при повреждённом архиве и изменённых исходниках.
 4. Node 22, Playwright 1.62.1 и Chromium: `tests/frontend_connection.cjs`,
-   затем `node --test tests/frontend_history.mjs`.
+   затем `node --test tests/frontend_history.mjs` и `tests/frontend_inbox.cjs`:
+   общий список, фильтры, получатели, история, переименование и мобильный вид.
 5. Сборка Docker-образа и проверка синтаксиса/импортов внутри контейнера
    с `--network none --read-only`. Провайдеры и реальные сессии не запускаются.
 6. Формирование архива и проверка его SHA-256. Успешный запуск публикует artifact
@@ -48,6 +51,7 @@ export NODE_PATH="$PWD/tests/browser/node_modules"
 export CHROMIUM_PATH="$(node -p 'require("./tests/browser/node_modules/playwright").chromium.executablePath()')"
 node tests/frontend_connection.cjs
 node --test tests/frontend_history.mjs
+node tests/frontend_inbox.cjs
 ```
 
 `tests/browser/package.json` и `package-lock.json` закрепляют версию Playwright

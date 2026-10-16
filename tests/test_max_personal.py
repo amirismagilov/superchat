@@ -302,7 +302,7 @@ def test_live_incoming_is_not_hidden_behind_frozen_history(sdk):
         adapter.client = NS(is_connected=True, me=NS(contact=NS(id=11)),
                             chats=[NS(id=42, title="Customer")], fetch_history=AsyncMock(side_effect=history))
         events = await adapter.poll()
-        assert {event.provider_id for event in events} == {"new", "19", "18"}
+        assert {event.provider_id for event in events if not event.metadata.get("conversation_only")} == {"new", "19", "18"}
         assert next(event for event in events if event.provider_id == "new").direction == "inbound"
         assert next(event for event in events if event.provider_id == "19").direction == "outbound"
         assert config["_max_cursors"]["42"]["before"] == 18000
@@ -318,7 +318,43 @@ def test_late_stored_message_is_replayed_even_below_history_watermark(sdk):
         adapter.client = NS(is_connected=True, me=NS(contact=NS(id=11)),
                             chats=[NS(id=42, title="Customer")],
                             fetch_history=AsyncMock(return_value=[message]))
-        assert [event.provider_id for event in await adapter.poll()] == ["late"]
+        assert [event.provider_id for event in await adapter.poll() if not event.metadata.get("conversation_only")] == ["late"]
         assert adapter.client.fetch_history.await_count == 1
 
+    run(exercise())
+
+
+def test_old_page_failure_keeps_latest_message_and_durable_backfill_cursor(sdk):
+    async def exercise():
+        current = NS(id="new", time=101000, sender=22, text="new", attaches=[])
+        async def history(**kwargs):
+            if kwargs["from_time"] == 100000:
+                return [current]
+            raise TimeoutError()
+        config = {"max_self": {"id": "11"}, "_max_history": {"days": 3650, "boundary": 90,
+            "completed": [], "catalog_after": 0}, "_max_cursors": {
+            "42": {"floor": 1000, "ceiling": 50000, "before": 20000}}}
+        value = maxmod.MaxPersonalAdapter(config)
+        value.client = NS(is_connected=True, me=NS(contact=NS(id=11)), chats=[NS(id=42, title="Customer")],
+                          fetch_history=AsyncMock(side_effect=history))
+        events = await value.poll()
+        assert [event.provider_id for event in events if event.provider_id] == ["new"]
+        assert next(event for event in events if event.provider_id).metadata["historical"] is False
+        assert config["_max_cursors"]["42"]["before"] == 20000
+        assert config["history_status"]["state"] == "partial" and config["history_status"]["chats_completed"] == 0
+    run(exercise())
+
+
+def test_timestamp_overflow_reports_partial_without_skipping_or_blocking_live(sdk):
+    async def exercise():
+        records = [NS(id=str(i), time=100000, sender=22, text="same timestamp", attaches=[]) for i in range(2)]
+        value = maxmod.MaxPersonalAdapter({"max_self": {"id": "11"}})
+        value.PAGE_SIZE = 2
+        value.client = NS(is_connected=True, me=NS(contact=NS(id=11)), chats=[NS(id=42, title="Customer")],
+                          fetch_history=AsyncMock(return_value=records))
+        events = await value.poll()
+        assert {event.provider_id for event in events if event.provider_id} == {"0", "1"}
+        assert value.config["_max_cursors"]["42"]["before"] == 100000
+        assert value.config["history_status"]["state"] == "partial"
+        assert value.config["history_status"]["chats_completed"] == 0
     run(exercise())

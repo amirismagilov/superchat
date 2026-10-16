@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create/validate the schema; reviewed additive 0001 -> 0002 upgrade only."""
+"""Create/validate the schema; reviewed additive 0001 -> 0002 -> 0003 upgrades."""
 
 import hashlib
 import json
@@ -11,12 +11,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sqlalchemy import Column, MetaData, String, Table, inspect, select, text
 
 from app.config import settings
-from app.db import Base, IntegrationSetting, engine
+from app.db import Base, Conversation, ConversationInbox, IntegrationSetting, engine
 
 
-REVISION = "0002_telegram_integration"
-PREVIOUS_REVISION = "0001_initial"
-PREVIOUS_FINGERPRINT = "aeb4968bcf77d102581f0af87370e319a518e221c950f6fb9176ef901441f890"
+REVISION = "0003_inbox"
+PREVIOUS_REVISION = "0002_telegram_integration"
+PREVIOUS_FINGERPRINT = "b697e7c84123936ccf4f449cda1de314fddc38e6df7f9325f6438b24710ef786"
+INITIAL_REVISION = "0001_initial"
+INITIAL_FINGERPRINT = "aeb4968bcf77d102581f0af87370e319a518e221c950f6fb9176ef901441f890"
+INBOX_TABLES = frozenset({"conversation_inbox", "conversation_reads", "message_inbox"})
 revision_table = Table(
     "omnicrm_schema_revision", MetaData(),
     Column("revision", String(64), primary_key=True),
@@ -78,18 +81,37 @@ def main():
             if len(revisions) != 1:
                 raise RuntimeError("Unknown or changed schema revision; supply a reviewed upgrade migration")
             current = revisions[0]
-            if current.revision == PREVIOUS_REVISION and current.model_fingerprint == PREVIOUS_FINGERPRINT:
-                original_tables = [table for table in Base.metadata.sorted_tables if table.name != IntegrationSetting.__tablename__]
-                if fingerprint(original_tables) != PREVIOUS_FINGERPRINT:
+            previous = {PREVIOUS_REVISION: PREVIOUS_FINGERPRINT, INITIAL_REVISION: INITIAL_FINGERPRINT}
+            if current.revision in previous and current.model_fingerprint == previous[current.revision]:
+                added = set(INBOX_TABLES)
+                if current.revision == INITIAL_REVISION:
+                    added.add(IntegrationSetting.__tablename__)
+                original_tables = [table for table in Base.metadata.sorted_tables if table.name not in added]
+                if fingerprint(original_tables) != previous[current.revision]:
                     raise RuntimeError("Original models have changed; refusing an unreviewed upgrade")
                 validate_tables(connection, original_tables)
-                if IntegrationSetting.__tablename__ in existing:
-                    raise RuntimeError("Unversioned integration_settings table exists; inspect before upgrade")
-                # Only add an empty settings table. Existing rows, account keys,
-                # messages, outboxes, provider sessions and volumes are untouched.
-                IntegrationSetting.__table__.create(connection)
+                if added.intersection(existing):
+                    raise RuntimeError("Unversioned additive table exists; inspect before upgrade")
+                Base.metadata.create_all(connection, tables=[table for table in Base.metadata.sorted_tables if table.name in added])
+                # Only populate the new metadata table. Existing account keys,
+                # messages, outboxes and provider session bytes are untouched.
+                # Old messages deliberately get no live-inbound marker: importing
+                # this feature must not suddenly turn an old archive unread.
+                cursor = ""
+                while True:
+                    rows = connection.execute(select(Conversation.id, Conversation.title, Conversation.peer)
+                                              .where(Conversation.id > cursor).order_by(Conversation.id).limit(500)).all()
+                    if not rows:
+                        break
+                    connection.execute(ConversationInbox.__table__.insert(), [{
+                        "conversation_id": row.id, "stage": "new", "favorite": False,
+                        "title_custom": bool(row.title and row.title != row.peer),
+                        "search_text": "\n".join([row.title, row.peer]).casefold()[:8192],
+                        "peer_aliases": [],
+                    } for row in rows])
+                    cursor = rows[-1].id
                 connection.execute(revision_table.update().values(revision=REVISION, model_fingerprint=model_hash))
-                print(f"Upgraded {PREVIOUS_REVISION} -> {REVISION}; existing records preserved.")
+                print(f"Upgraded {current.revision} -> {REVISION}; existing records preserved.")
             elif current.revision != REVISION or current.model_fingerprint != model_hash:
                 raise RuntimeError("Unknown or changed schema revision; supply a reviewed upgrade migration")
             validate_tables(connection)

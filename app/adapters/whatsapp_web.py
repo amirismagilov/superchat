@@ -14,7 +14,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from .base import Adapter, AuthResult, Event, ProviderError
+from .base import Adapter, AuthResult, Event, ProviderError, history_days
 
 
 def _experimental_enabled() -> bool:
@@ -90,6 +90,7 @@ def _sent_message_identity(result: object) -> tuple[str, str, dict]:
 class WhatsAppWebAdapter(Adapter):
     PAGE_SIZE = 100
     CHATS_PER_POLL = 10
+    HISTORY_CHATS_PER_POLL = 2
     HISTORY_OVERLAP_SECONDS = 300
     CONNECT_WAIT_SECONDS = 120
     PROVIDER_STATES = frozenset({
@@ -321,7 +322,7 @@ class WhatsAppWebAdapter(Adapter):
         mappings = self.config.setdefault("_waha_lid_pn", {})
         if resolve_lid and peer.endswith("@lid") and peer not in mappings:
             result = await self._request(
-                "GET", f"/api/{self.session}/lids/{quote(peer, safe='')}", allow_404=True,
+                "GET", f"/api/{self.session}/lids/{quote(peer, safe='')}", allow_404=True, timeout=2,
             )
             if result is not None:
                 if not isinstance(result, dict):
@@ -365,20 +366,47 @@ class WhatsAppWebAdapter(Adapter):
             metadata={"has_media": bool(message.get("hasMedia")), **identity},
         )
 
+    def _history(self) -> dict:
+        if "_waha_history" not in self.config:
+            days = history_days(self.config, 30)
+            self.config["_waha_history"] = {"days": days, "boundary": time.time(), "discovery_done": False,
+                                            "completed": [], "offset": 0}
+        return self.config["_waha_history"]
+
+    async def request_history(self, payload: dict) -> AuthResult:
+        days = history_days(payload)
+        self.config["_waha_history"] = {"days": days, "boundary": time.time(), "discovery_done": False,
+                                        "completed": [], "offset": 0}
+        # The session, aliases, independent live tail and provider identity stay
+        # intact. Only backfill/discovery traversal is restarted.
+        self.config.pop("_waha_cursors", None)
+        self.config["_waha_chat_offset"] = 0
+        self._history_status()
+        return AuthResult("connected")
+
+    def _history_status(self) -> None:
+        history = self._history()
+        count = len(self.config.get("_waha_catalog", {}))
+        completed = len(history["completed"])
+        done = history["discovery_done"] and completed >= count
+        self.config["history_status"] = {
+            "state": "partial" if history.get("error") else "complete" if done else "importing",
+            "chats_discovered": count, "chats_completed": completed, "history_days": history["days"],
+            "reason": "history_fetch_failed" if history.get("error") else "waha_device_history_only",
+        }
+
     async def poll(self) -> list[Event]:
         if self.config.get("wa_identity_mismatch"):
             raise ProviderError("whatsapp_account_identity_changed")
         await self.start()
-        history_days = min(max(int(self.config.get("history_days", 30)), 1), 3650)
-        # Persistent NOWEB 2026.9.2 supports the ALL_JID sentinel (`all`) in
-        # SqlMessagesMethods.getAllByJid. Read newest messages independently of
-        # the chat list and its backlog: message/chat store writes are async.
-        # No advancing lower watermark: a late store write must remain visible.
+        history = self._history()
+        catalog = self.config.setdefault("_waha_catalog", {})
+        history.pop("error", None)
+        # Keep the proven all-JID live tail independent of history traversal.
         live = await self._request("GET", f"/api/{self.session}/chats/all/messages", params={
             "limit": self.PAGE_SIZE, "offset": 0,
             "sortBy": "timestamp", "sortOrder": "desc", "downloadMedia": "false",
-            "filter.timestamp.gte": int(time.time()) - history_days * 86400,
-        })
+        }, timeout=6)
         if not isinstance(live, list):
             raise ProviderError("waha_invalid_history_response")
         for message in live:
@@ -387,73 +415,118 @@ class WhatsAppWebAdapter(Adapter):
             peer, key = self._message_peer(message)
             if peer:
                 self._remember_peer_alias(peer, key)
+        # Resolve active LIDs before discovery/backfill emits any events. A
+        # cached discovery identity must not prevent a later provider PN lookup.
+        candidates = set(catalog) | set(self.config.get("_waha_cursors", {}))
+        candidates.update(self._message_peer(message)[0] for message in live)
+        candidates = sorted(peer for peer in candidates if peer.endswith("@lid")
+                            and peer not in self.config.get("_waha_lid_pn", {}))
+        if candidates:
+            lid_offset = int(self.config.get("_waha_lid_offset", 0)) % len(candidates)
+            selected_lids = (candidates[lid_offset:] + candidates[:lid_offset])[:2]
+            for peer in selected_lids:
+                try:
+                    await self._peer_metadata(peer)
+                except ProviderError:
+                    pass
+            self.config["_waha_lid_offset"] = (lid_offset + len(selected_lids)) % len(candidates)
         offset = int(self.config.get("_waha_chat_offset", 0))
-        chats = await self._request("GET", f"/api/{self.session}/chats", params={
-            "limit": self.CHATS_PER_POLL, "offset": offset,
-            "sortBy": "id", "sortOrder": "asc",
-        })
-        if not isinstance(chats, list):
-            raise ProviderError("waha_invalid_chats_response")
-        cursors = self.config.setdefault("_waha_cursors", {})
-        events = {}
-        names = {}
-        identities = {}
-        for chat in chats:
+        try:
+            chats = await self._request("GET", f"/api/{self.session}/chats", params={
+                "limit": self.CHATS_PER_POLL, "offset": offset,
+                "sortBy": "id", "sortOrder": "asc",
+            }, timeout=6)
+            if not isinstance(chats, list):
+                raise ProviderError("waha_invalid_chats_response")
+        except ProviderError:
+            chats = None
+            history["error"] = True
+        events, identities = {}, {}
+        for chat in chats or []:
             peer = _to_cus_format(str(chat.get("id", "")))
             if not re.fullmatch(r"[0-9-]+@(?:c\.us|g\.us|lid)", peer):
                 continue
-            names[peer] = chat.get("name")
-            identity = await self._peer_metadata(peer)
+            name = chat.get("name") or chat.get("subject") or catalog.get(peer, {}).get("name")
+            identity = await self._peer_metadata(peer, resolve_lid=False)
+            identities[peer] = identity
+            # Discovery is durable even for empty/provider-truncated chats.
+            if (peer not in catalog or name != catalog[peer].get("name")
+                    or catalog[peer].get("canonical_peer") != identity["canonical_peer"]):
+                events[("conversation", peer)] = Event("", peer, "", peer_name=name,
+                    metadata={**identity, "conversation_only": True})
+            catalog[peer] = {"name": name, "canonical_peer": identity["canonical_peer"]}
+        if chats is not None and len(chats) < self.CHATS_PER_POLL:
+            history["discovery_done"] = True
+            self.config["_waha_chat_offset"] = 0
+        elif chats is not None:
+            self.config["_waha_chat_offset"] = offset + len(chats)
+        # Catalog enumeration and backfill have separate persisted cursors. A
+        # long first chat cannot hide later/empty chats or starve recent events.
+        peers = sorted(catalog)
+        round_offset = history["offset"] % len(peers) if peers else 0
+        selected = peers[round_offset:round_offset + self.HISTORY_CHATS_PER_POLL]
+        cursors = self.config.setdefault("_waha_cursors", {})
+        for peer in selected:
+            identity = identities.get(peer) or await self._peer_metadata(peer, resolve_lid=False)
             identities[peer] = identity
             cursor = cursors.setdefault(peer, {})
             if "ceiling" not in cursor:
                 now = int(time.time()) - 1
-                floor = now - history_days * 86400
+                floor = max(0, int(history["boundary"]) - history["days"] * 86400)
                 if "watermark" in cursor:
                     floor = max(floor, cursor["watermark"] - self.HISTORY_OVERLAP_SECONDS)
                 cursor.update(floor=floor, ceiling=now, offset=0)
-            messages = await self._request("GET", f"/api/{self.session}/chats/{quote(peer, safe='')}/messages", params={
-                "limit": self.PAGE_SIZE, "offset": cursor["offset"],
-                "sortBy": "timestamp", "sortOrder": "asc", "downloadMedia": "false",
-                "filter.timestamp.gte": cursor["floor"], "filter.timestamp.lte": cursor["ceiling"],
-            })
-            if not isinstance(messages, list):
-                raise ProviderError("waha_invalid_history_response")
-            for message in messages:
-                event = self._event(message, peer, identity, chat.get("name"))
-                events[(identity["canonical_peer"], event.provider_id)] = event
-            if len(messages) < self.PAGE_SIZE:
-                # The next window overlaps to allow delayed store writes, as
-                # well as timestamp ties. Database ingest deduplicates IDs.
-                cursors[peer] = {"watermark": cursor["ceiling"]}
-            else:
-                cursor["offset"] += len(messages)
-        self.config["_waha_chat_offset"] = offset + len(chats) if len(chats) == self.CHATS_PER_POLL else 0
+            try:
+                messages = await self._request("GET", f"/api/{self.session}/chats/{quote(peer, safe='')}/messages", params={
+                    "limit": self.PAGE_SIZE, "offset": cursor["offset"],
+                    "sortBy": "timestamp", "sortOrder": "asc", "downloadMedia": "false",
+                    "filter.timestamp.gte": cursor["floor"], "filter.timestamp.lte": cursor["ceiling"],
+                }, timeout=8)
+                if not isinstance(messages, list):
+                    raise ProviderError("waha_invalid_history_response")
+                for message in messages:
+                    event = self._event(message, peer, identity, catalog[peer].get("name"))
+                    event.metadata["historical"] = (event.timestamp or 0) <= history["boundary"]
+                    events[(identity["canonical_peer"], event.provider_id)] = event
+                if len(messages) < self.PAGE_SIZE:
+                    cursors[peer] = {"watermark": cursor["ceiling"]}
+                    if peer not in history["completed"]:
+                        history["completed"].append(peer)
+                else:
+                    cursor["offset"] += len(messages)
+            except ProviderError:
+                # Return and commit the independent live events, retaining this
+                # history cursor for retry; one bad history must not block send.
+                history["error"] = True
+        history["offset"] = (round_offset + len(selected)) % len(peers) if peers else 0
         previous_live = getattr(self, "_live_seen", {})
         current_live = {}
-        lid_lookups = 0
         for message in reversed(live):
             peer, _key = self._message_peer(message)
-            if not peer:  # Status, newsletter and unsupported system records.
+            if not peer:
                 continue
             if peer not in identities:
-                unresolved = peer.endswith("@lid") and peer not in self.config.get("_waha_lid_pn", {})
-                identities[peer] = await self._peer_metadata(peer, resolve_lid=lid_lookups < self.CHATS_PER_POLL)
-                lid_lookups += unresolved
+                identities[peer] = await self._peer_metadata(peer, resolve_lid=False)
             identity = identities[peer]
             key = (identity["canonical_peer"], str(message.get("id", "")))
-            name = names.get(peer) or names.get(identity["canonical_peer"])
-            if not name and key in events:
-                name = events[key].peer_name
+            name = catalog.get(peer, {}).get("name") or catalog.get(identity["canonical_peer"], {}).get("name")
+            raw = message.get("_data") or {}
+            if not name and not peer.endswith("@g.us") and not message.get("fromMe") and isinstance(raw, dict):
+                name = raw.get("pushName")
+            if (peer not in catalog or (name and name != catalog[peer].get("name"))
+                    or catalog[peer].get("canonical_peer") != identity["canonical_peer"]):
+                catalog[peer] = {"name": name, "canonical_peer": identity["canonical_peer"]}
+                events[("conversation", peer)] = Event("", peer, "", peer_name=name,
+                    metadata={**identity, "conversation_only": True})
             event = self._event(message, peer, identity, name)
+            event.metadata["historical"] = (event.timestamp or 0) <= history["boundary"]
             fingerprint = (event.peer, event.direction, event.timestamp, event.text,
                            event.status, event.metadata["has_media"], tuple(identity["aliases"]))
             current_live[key] = fingerprint
             if key in events or previous_live.get(key) != fingerprint:
                 events[key] = event
-        # Only a bounded in-memory cache. A worker DB failure discards this
-        # adapter, so a retry/restart replays the tail instead of losing data.
         self._live_seen = current_live
+        self._history_status()
         return list(events.values())
 
     async def close(self) -> None:

@@ -78,7 +78,10 @@ class StoredHistory:
         if path.startswith(f"{prefix}/chats/") and path.endswith("/messages"):
             peer = path[len(f"{prefix}/chats/"):-len("/messages")]
             all_chats = peer in {"all", "all@c.us", "all@s.whatsapp.net"}
-            assert all_chats or peer in self.peers, "Unexpected history target"
+            # The global message store may expose a chat before the separate
+            # chat index catches up. Progressive discovery can then backfill it.
+            known_peers = set(self.peers) | {message["from"] for message in self.messages}
+            assert all_chats or peer in known_peers, "Unexpected history target"
             rows = [message for message in self.messages
                     if all_chats or message["from"] == peer]
             floor = float(params.get("filter.timestamp.gte", "-inf"))
@@ -134,7 +137,11 @@ async def test_delayed_store_message_before_previous_empty_watermark_is_received
     store = StoredHistory()
     adapter = store.adapter()
     try:
-        assert await adapter.poll() == []  # Existing implementation advances to t=99.
+        discovered = await adapter.poll()  # Empty history advances to t=99.
+        assert len(discovered) == 1 and discovered[0].metadata["conversation_only"]
+        persist(database, discovered)
+        assert list(database[0].scalars(select(Message))) == []
+        assert database[0].scalar(select(Conversation)).peer == PHONE
         saved = copy.deepcopy(adapter.config)
     finally:
         await adapter.close()
@@ -226,7 +233,11 @@ async def test_delayed_message_outside_global_tail_is_recovered_by_history_overl
     store = StoredHistory()
     adapter = store.adapter()
     try:
-        assert await adapter.poll() == []  # Empty history window ends at t=99.
+        discovered = await adapter.poll()  # Empty history window ends at t=99.
+        assert len(discovered) == 1 and discovered[0].metadata["conversation_only"]
+        persist(database, discovered)
+        assert list(database[0].scalars(select(Message))) == []
+        assert database[0].scalar(select(Conversation)).peer == PHONE
         late = stored_message("late-outside-live-tail", 98)
         # Every newer record sorts ahead of `late` in the bounded newest page.
         newer = [stored_message(f"newer-{index}", 100)

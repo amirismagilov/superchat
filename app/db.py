@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import (JSON, DateTime, ForeignKey, Index, Integer, String, Text,
+from sqlalchemy import (JSON, Boolean, DateTime, ForeignKey, Index, Integer, String, Text,
                         UniqueConstraint, create_engine)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
@@ -74,6 +74,34 @@ class Message(Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class ConversationInbox(Base):
+    """Additive CRM metadata; older app images can still use the original tables."""
+    __tablename__ = "conversation_inbox"
+    conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True)
+    stage: Mapped[str] = mapped_column(String(32), default="new")
+    favorite: Mapped[bool] = mapped_column(Boolean, default=False)
+    title_custom: Mapped[bool] = mapped_column(Boolean, default=False)
+    search_text: Mapped[str] = mapped_column(Text, default="")
+    peer_aliases: Mapped[list] = mapped_column(JSON, default=list)
+
+
+class ConversationRead(Base):
+    """Each user acknowledges only message IDs actually displayed to them."""
+    __tablename__ = "conversation_reads"
+    conversation_id: Mapped[str] = mapped_column(ForeignKey("conversations.id", ondelete="CASCADE"), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    last_message_id: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class MessageInbox(Base):
+    __tablename__ = "message_inbox"
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"), primary_key=True)
+    historical: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Provider time for imported outgoing messages; actual acceptance time for
+    # CRM outbox sends. Queued/failed messages cannot resolve response waiting.
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Job(Base):

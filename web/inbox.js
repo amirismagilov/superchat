@@ -16,9 +16,13 @@ const ICONS = {
   refresh: ['M20 11a8 8 0 0 0-14-5L3 9', 'M3 3v6h6', 'M4 13a8 8 0 0 0 14 5l3-3', 'M21 21v-6h-6'],
   inbox: ['M4 4h16l2 12v4H2v-4z', 'M2 14h6l2 3h4l2-3h6'],
   warning: ['m12 3 10 18H2Z', 'M12 9v4', 'M12 17h.01'],
+  star: ['m12 3 2.8 5.7 6.3.9-4.6 4.4 1.1 6.3-5.6-3-5.6 3 1.1-6.3L3 9.6l6.2-.9Z'],
+  clock: ['M12 8v5l3 2', 'M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0'],
+  edit: ['m16 3 5 5-12 12-6 1 1-6Z', 'm14 5 5 5'],
 };
 const CHANNEL_LABELS = { telegram: 'Telegram', whatsapp_cloud: 'WhatsApp Business', whatsapp_web: 'WhatsApp', max_bot: 'MAX · бот', max_personal: 'MAX', sms_gateway: 'SMS', demo: 'Демо-канал' };
 const CHANNEL_INITIALS = { telegram: '↗', whatsapp_cloud: 'W', whatsapp_web: 'W', max_bot: 'M', max_personal: 'M', sms_gateway: 'SMS', demo: 'D' };
+const CONVERSATION_STAGES = { new: 'Первичный контакт', in_progress: 'В работе', done: 'Завершён' };
 const MESSAGE_STATUSES = { queued: 'В очереди', sending: 'Отправляется', sent: 'Отправлено', delivered: 'Доставлено', read: 'Прочитано', failed: 'Не отправлено', uncertain: 'Доставка не подтверждена', received: '' };
 const STATE_LABELS = { connected: 'Подключён', ready: 'Подключён', authorized: 'Подключён', active: 'Подключён', working: 'Подключён', disconnected: 'Отключён', offline: 'Не в сети', error: 'Ошибка', failed: 'Ошибка', created: 'Нужно подключить', new: 'Нужно подключить', pending: 'Ожидает подключения', pending_login: 'Ожидает входа', needs_login: 'Нужен вход', login_required: 'Нужен вход', need_code: 'Ожидает код', code_required: 'Ожидает код', awaiting_code: 'Ожидает код', need_password: 'Ожидает пароль', password_required: 'Ожидает пароль', awaiting_password: 'Ожидает пароль', qr: 'Нужно отсканировать QR', qr_required: 'Нужно отсканировать QR', scan_qr_code: 'Нужно отсканировать QR', needs_qr: 'Нужно отсканировать QR', starting: 'Подключается', connecting: 'Подключается', awaiting_qr: 'Ожидает QR-код', reauth_required: 'Нужен повторный вход', action_required: 'Требуется действие' };
 
@@ -110,6 +114,8 @@ function array(value) { return Array.isArray(value) ? value : value?.items || []
 function date(value) { if (!value) return null; const d = new Date(value); return Number.isNaN(d.getTime()) ? null : d; }
 function timeLabel(value) { return date(value)?.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }) || ''; }
 function dateLabel(value) { return date(value)?.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' }) || ''; }
+function shortDateLabel(value) { const d = date(value); if (!d) return ''; return d.toDateString() === new Date().toDateString() ? 'Сегодня' : d.toLocaleDateString('ru-RU', { day: 'numeric', month: 'short' }); }
+function waitingLabel(value) { const elapsed = Math.max(0, Math.floor((Date.now() - (date(value)?.getTime() || Date.now())) / 60000)); return elapsed < 1 ? 'Только что' : elapsed < 60 ? `${elapsed} мин` : elapsed < 1440 ? `${Math.floor(elapsed / 60)} ч ${elapsed % 60} мин` : `${Math.floor(elapsed / 1440)} д`; }
 function stateLabel(state) { return STATE_LABELS[String(state || '').toLowerCase()] || state || 'Не подключён'; }
 function stateColor(state) { const s = String(state || '').toLowerCase(); return /^(connected|ready|authorized|active|working)$/.test(s) ? 'green' : /error|failed|disconnected/.test(s) ? 'red' : 'orange'; }
 function modeBadge(capability, channel) {
@@ -138,6 +144,8 @@ export class OmniInbox extends HTMLElement {
     this._pendingSends = new Map();
     this._jobs = new Set();
     this._connectionJobs = new Map();
+    this._filterAccountId = ''; this._filterChannel = ''; this._inboxQuery = ''; this._inboxOffset = 0; this._inboxPageSize = 50; this._inboxRequest = 0; this._inboxTotal = 0; this._inboxHasMore = false;
+    this._activeConversation = null; this._conversationMutations = new Set(); this._lastRead = new Map(); this._reading = new Set(); this._historyJobs = new Map();
     this._session = new AbortController();
     this._visibility = () => { if (!document.hidden && this._identity) this.refresh(); };
   }
@@ -160,13 +168,15 @@ export class OmniInbox extends HTMLElement {
     this._pendingSends.clear();
     this._jobs.clear();
     this._connectionJobs.clear();
+    this._filterAccountId = ''; this._filterChannel = ''; this._inboxQuery = ''; this._inboxOffset = 0; this._inboxTotal = 0; this._inboxHasMore = false; this._inboxRequest += 1; this._activeConversation = null;
+    this._conversationMutations.clear(); this._lastRead.clear(); this._reading.clear(); this._historyJobs.clear(); clearTimeout(this._searchTimer); clearTimeout(this._readTimer);
     this.closeModal();
     if (this.isConnected) this._token ? this.initialize() : this.renderLogin();
   }
   get baseUrl() { return this._baseUrl; }
   set baseUrl(value) { this._baseUrl = String(value || '').replace(/\/+$/, ''); }
   get account() { return this._accounts.find(a => a.id === this._selectedAccount); }
-  get conversation() { return this._conversations.find(c => c.id === this._selectedConversation); }
+  get conversation() { return this._activeConversation?.id === this._selectedConversation ? this._activeConversation : this._conversations.find(c => c.id === this._selectedConversation); }
   capability(channel) { return this._capabilities.find(c => c.channel === channel); }
 
   async api(path, options = {}) {
@@ -210,7 +220,7 @@ export class OmniInbox extends HTMLElement {
       this._accounts = array(accounts);
       this._capabilities = array(capabilities);
       this.renderShell();
-      if (this._accounts.length) await this.selectAccount(this._accounts[0].id);
+      await this.loadInbox();
       this._poll = setInterval(() => { if (!document.hidden) this.refresh(); }, 3000);
       this.dispatchEvent(new CustomEvent('omni-ready', { detail: { user: { sub: identity.sub, tenant_id: identity.tenant_id, role: identity.role } }, bubbles: true, composed: true }));
     } catch (error) { if (generation === this._generation) this.renderLogin(error.message); }
@@ -253,19 +263,23 @@ export class OmniInbox extends HTMLElement {
     const header = this.brandHeader();
     this._connectionLabel = el('span', {}, 'Обновление каждые 3 с');
     const identityName = this._identity.sub === 'local-owner' && this._identity.tenant_id === 'local-test' ? 'Локальный администратор' : this._identity.sub;
-    const identity = el('div', { class: 'identity' }, [el('div', { class: 'avatar' }, initials(identityName)), el('div', {}, [el('div', { class: 'identity-name', title: identityName }, identityName), el('div', { class: 'identity-role' }, this._identity.role === 'admin' ? 'Администратор' : 'Менеджер')])]);
-    header.append(el('div', { class: 'topbar-end' }, [el('div', { class: 'connection-pill' }, [el('span', { class: 'status-dot green' }), this._connectionLabel]), identity, iconButton('logout', 'Выйти', () => { this.token = ''; this.dispatchEvent(new CustomEvent('omni-logout', { bubbles: true, composed: true })); })]));
+    header.append(el('div', { class: 'topbar-end' }, [el('div', { class: 'connection-pill' }, [el('span', { class: 'status-dot green' }), this._connectionLabel]), el('div', { class: 'identity' }, [el('div', { class: 'avatar' }, initials(identityName)), el('div', {}, [el('div', { class: 'identity-name' }, identityName), el('div', { class: 'identity-role' }, this._identity.role === 'admin' ? 'Администратор' : 'Менеджер')])]), iconButton('logout', 'Выйти', () => { this.token = ''; this.dispatchEvent(new CustomEvent('omni-logout', { bubbles: true, composed: true })); })]));
     this._errorBanner = el('div', { class: 'error-banner', role: 'alert', hidden: true });
-    this._accountList = el('div', { class: 'account-list' });
-    this._accountPanel = el('aside', { class: 'accounts-panel', 'aria-label': 'Рабочие аккаунты' }, [el('div', { class: 'panel-heading' }, [el('h2', {}, 'Каналы'), iconButton('close', 'Закрыть каналы', () => this._workspace.classList.remove('accounts-open'), 'mobile-accounts')]), el('div', { class: 'eyebrow account-group-label' }, 'Мои аккаунты'), this._accountList, el('div', { class: 'account-bottom' }, [button('Подключить канал', () => this.openConnect(), 'full', 'plus'), el('p', { class: 'account-tip' }, 'Клиент общается с вашим рабочим аккаунтом. История остаётся в компании.')])]);
     this._conversationCount = el('span', { class: 'count' }, '0');
-    this._search = el('input', { type: 'search', placeholder: 'Найти диалог', 'aria-label': 'Найти диалог', oninput: () => this.renderConversations() });
-    this._conversationList = el('div', { class: 'conversation-list' });
-    this._conversationFooter = el('div', { class: 'conversation-footer' });
-    const conversations = el('section', { class: 'conversations-panel', 'aria-label': 'Список диалогов' }, [el('div', { class: 'panel-heading' }, [el('div', { class: 'heading-group' }, [iconButton('settings', 'Выбрать канал', () => this._workspace.classList.add('accounts-open'), 'mobile-accounts'), el('h2', {}, 'Диалоги'), this._conversationCount]), iconButton('plus', 'Новый диалог', () => this.openNewConversation())]), el('div', { class: 'search' }, [icon('search', 15), this._search]), this._conversationList, this._conversationFooter]);
-    this._chatPanel = el('section', { class: 'chat-panel', 'aria-label': 'Переписка' });
-    this._workspace = el('main', { class: 'workspace' }, [this._accountPanel, conversations, this._chatPanel]);
-    this._root.replaceChildren(el('div', { class: 'app' }, [header, this._errorBanner, this._workspace]));
+    this._search = el('input', { type: 'search', placeholder: 'Имя, компания или телефон', 'aria-label': 'Найти диалог', oninput: () => { this._inboxQuery = this._search.value.trim(); this._inboxOffset = 0; this._inboxRequest += 1; clearTimeout(this._searchTimer); this._searchTimer = setTimeout(() => this.loadInbox(), 250); } });
+    this._channelFilter = el('select', { 'aria-label': 'Мессенджер', onchange: () => { this._filterChannel = this._channelFilter.value; this._filterAccountId = ''; this._inboxOffset = 0; this.renderAccounts(); this.loadInbox(); } });
+    this._accountFilter = el('select', { 'aria-label': 'Рабочий аккаунт', onchange: () => { this._filterAccountId = this._accountFilter.value; this._inboxOffset = 0; this.loadInbox(); } });
+    this._historyButton = button('Загрузить историю', () => this.openHistoryImport(), '', 'refresh');
+    this._inboxStatus = el('div', { class: 'inbox-status', role: 'status', 'aria-live': 'polite' });
+    this._conversationList = el('div', { class: 'inbox-table-scroll' });
+    this._conversationFooter = el('div', { class: 'inbox-pagination' });
+    const filters = el('div', { class: 'inbox-filters' }, [el('div', { class: 'search inbox-search' }, [icon('search', 16), this._search]), el('label', { class: 'inbox-filter' }, [el('span', {}, 'Мессенджер'), this._channelFilter]), el('label', { class: 'inbox-filter account-filter' }, [el('span', {}, 'Рабочий аккаунт'), this._accountFilter]), iconButton('settings', 'Выбрать канал', () => this._accountFilter.focus(), 'inbox-filter-focus')]);
+    const toolbar = el('div', { class: 'inbox-toolbar' }, [el('div', {}, [el('div', { class: 'inbox-heading' }, [el('h1', {}, 'Все диалоги'), this._conversationCount]), el('p', {}, 'Клиенты и переписка из всех рабочих мессенджеров')]), el('div', { class: 'inbox-actions' }, [this._historyButton, button('Подключить канал', () => this.openConnect(), '', 'plus'), button('Новый диалог', () => this.openNewConversation(), 'primary', 'plus')])]);
+    this._inboxPanel = el('section', { class: 'inbox-panel', 'aria-label': 'Все диалоги' }, [toolbar, filters, this._inboxStatus, this._conversationList, this._conversationFooter]);
+    this._chatPanel = el('section', { class: 'chat-panel', 'aria-label': 'Переписка', hidden: true });
+    this._workspace = el('main', { class: 'workspace inbox-workspace' }, [this._inboxPanel, this._chatPanel]);
+    this._root.replaceChildren(el('div', { class: 'app inbox-app' }, [header, this._errorBanner, this._workspace]));
+    this._channelSignature = null; this._accountSignature = null;
     this.renderAccounts(); this.renderConversations(); this.renderChat();
   }
   showError(message) {
@@ -274,42 +288,117 @@ export class OmniInbox extends HTMLElement {
     this._errorBanner.hidden = false;
   }
   renderAccounts() {
-    this._accountList.replaceChildren(...this._accounts.map(account => el('button', { type: 'button', class: `account-button${this._selectedAccount === account.id ? ' selected' : ''}`, 'aria-pressed': String(this._selectedAccount === account.id), onclick: () => this.selectAccount(account.id) }, [channelIcon(account.channel), el('div', { class: 'account-text' }, [el('div', { class: 'account-label' }, account.label), el('div', { class: 'account-caption' }, [el('span', { class: `status-dot ${stateColor(account.state)}` }), el('span', {}, stateLabel(account.state))])])])));
-    if (!this._accounts.length) this._accountList.append(emptyState('Пока нет каналов', 'Подключите рабочий аккаунт, чтобы начать переписку.', null, true));
-    if (this.account) this._conversationFooter.replaceChildren(el('span', { class: `status-dot ${stateColor(this.account.state)}` }), el('span', {}, `${CHANNEL_LABELS[this.account.channel] || this.account.channel} · ${stateLabel(this.account.state)}`), iconButton('settings', 'Управлять подключением', () => this.openManageAccount(this.account)));
+    if (!this._accountFilter) return;
+    const channels = [...new Set(this._accounts.map(account => account.channel))];
+    const channelSignature = JSON.stringify(channels);
+    if (this._channelSignature !== channelSignature) { this._channelSignature = channelSignature; this._channelFilter.replaceChildren(el('option', { value: '' }, 'Все мессенджеры'), ...channels.map(channel => el('option', { value: channel }, CHANNEL_LABELS[channel] || channel))); }
+    this._channelFilter.value = this._filterChannel || '';
+    const accounts = this._accounts.filter(account => !this._filterChannel || account.channel === this._filterChannel);
+    const signature = JSON.stringify(accounts.map(account => [account.id, account.label, account.state]));
+    if (signature !== this._accountSignature) { this._accountSignature = signature; this._accountFilter.replaceChildren(el('option', { value: '' }, 'Все аккаунты'), ...accounts.map(account => el('option', { value: account.id }, `${account.label} · ${CHANNEL_LABELS[account.channel] || account.channel}`))); }
+    this._accountFilter.value = this._filterAccountId || '';
+    this._historyButton.disabled = !this._accounts.some(account => ['telegram', 'whatsapp_web', 'max_personal'].includes(account.channel) && account.state === 'connected');
   }
   async selectAccount(id) {
-    if (this._composer && this._selectedConversation) this._drafts.set(this._selectedConversation, this._composer.value);
+    this.closeChat();
     this._selectedAccount = id;
-    this._selectedConversation = null;
-    this._conversations = [];
-    this._messages = [];
-    this._search.value = '';
-    this._workspace.classList.remove('accounts-open', 'chat-open');
-    this.renderAccounts(); this.renderConversations(); this.renderChat();
-    try { const result = await this.api(`/api/conversations?account_id=${encodeURIComponent(id)}`); if (this._selectedAccount !== id) return; this._conversations = array(result); this.renderConversations(); }
+    this._filterAccountId = id || '';
+    this._filterChannel = '';
+    this._inboxQuery = ''; this._search.value = ''; this._inboxOffset = 0;
+    this.renderAccounts();
+    await this.loadInbox();
+  }
+  inboxPath() {
+    const params = new URLSearchParams({ limit: String(this._inboxPageSize || 50), offset: String(this._inboxOffset || 0) });
+    if (this._inboxQuery) params.set('q', this._inboxQuery);
+    if (this._filterAccountId) params.set('account_id', this._filterAccountId);
+    if (this._filterChannel) params.set('channel', this._filterChannel);
+    return `/api/inbox?${params}`;
+  }
+  async loadInbox(quiet = false) {
+    const request = ++this._inboxRequest, generation = this._generation, path = this.inboxPath();
+    if (!quiet) { this._inboxLoading = true; this._inboxStatus.textContent = 'Загружаем диалоги…'; }
+    try {
+      const result = await this.api(path);
+      if (request !== this._inboxRequest || generation !== this._generation) return;
+      this._conversations = array(result); this._inboxTotal = Number(result.total ?? this._conversations.length); this._inboxHasMore = result.has_more === true;
+      const active = this._conversations.find(item => item.id === this._selectedConversation);
+      if (active) this._activeConversation = active;
+      this._inboxLoading = false; this._inboxStatus.textContent = ''; this.renderConversations();
+    } catch (error) { if (request === this._inboxRequest && generation === this._generation) { this._inboxLoading = false; this._inboxStatus.replaceChildren(el('span', {}, error.message), button('Повторить загрузку', () => this.loadInbox(), 'subtle', 'refresh')); } }
+  }
+  updateConversation(item) {
+    this._conversations = this._conversations.map(current => current.id === item.id ? { ...current, ...item } : current);
+    if (this._selectedConversation === item.id) this._activeConversation = { ...this._activeConversation, ...item };
+  }
+  async patchConversation(conversation, patch, control) {
+    if (this._conversationMutations.has(conversation.id)) return;
+    this._conversationMutations.add(conversation.id); if (control) control.disabled = true;
+    try { const updated = await this.api(`/api/conversations/${encodeURIComponent(conversation.id)}`, { method: 'PATCH', body: JSON.stringify(patch) }); this.updateConversation(updated); }
     catch (error) { this.showError(error.message); }
+    finally { this._conversationMutations.delete(conversation.id); this.renderConversations(); if (control?.isConnected) control.disabled = false; }
   }
   renderConversations() {
-    this._conversationCount.textContent = this._conversations.length;
-    const query = this._search.value.trim().toLocaleLowerCase('ru');
-    const conversations = this._conversations.filter(c => `${c.title} ${c.peer}`.toLocaleLowerCase('ru').includes(query)).sort((a, b) => (date(b.last_message_at)?.getTime() || 0) - (date(a.last_message_at)?.getTime() || 0));
-    this._conversationList.replaceChildren(...conversations.map(conversation => el('button', { type: 'button', class: `conversation-button${conversation.id === this._selectedConversation ? ' selected' : ''}`, 'aria-pressed': String(conversation.id === this._selectedConversation), onclick: () => this.selectConversation(conversation.id) }, [el('div', { class: 'avatar large' }, initials(conversation.title || conversation.peer)), el('div', { class: 'conversation-copy' }, [el('div', { class: 'conversation-topline' }, [el('span', { class: 'conversation-name' }, conversation.title || conversation.peer), el('time', { class: 'conversation-time', title: dateLabel(conversation.last_message_at) }, timeLabel(conversation.last_message_at))]), el('div', { class: 'conversation-preview' }, conversation.last_message?.text || conversation.peer)])])));
-    if (!conversations.length) this._conversationList.append(emptyState(query ? 'Ничего не найдено' : 'Здесь начнутся диалоги', query ? 'Попробуйте другое имя или номер.' : 'Новый диалог появится после входящего сообщения. Или создайте его сами.', !query && this.account ? button('Новый диалог', () => this.openNewConversation(), '', 'plus') : null, true));
+    if (!this._conversationList) return;
+    this._conversationCount.textContent = String(this._inboxTotal || 0);
+    const head = el('thead', {}, el('tr', {}, [el('th', { scope: 'col', class: 'favorite-col' }, el('span', { class: 'sr-only' }, 'Избранное')), el('th', { scope: 'col' }, 'Клиент'), el('th', { scope: 'col', class: 'channel-col' }, 'Мессенджер'), el('th', { scope: 'col', class: 'activity-col' }, 'Время'), el('th', { scope: 'col', class: 'stage-col' }, 'Этап'), el('th', { scope: 'col', class: 'waiting-col' }, 'Ожидает ответа')]));
+    const body = el('tbody');
+    for (const conversation of this._conversations) {
+      const account = this._accounts.find(item => item.id === conversation.account_id);
+      const channel = conversation.channel || account?.channel || '';
+      const name = conversation.title || conversation.peer;
+      const favorite = iconButton('star', `${conversation.favorite ? 'Убрать из избранного' : 'В избранное'}: ${name}`, event => { event.stopPropagation(); this.patchConversation(conversation, { favorite: !conversation.favorite }, favorite); }, `favorite-button${conversation.favorite ? ' active' : ''}`);
+      favorite.setAttribute('aria-pressed', String(!!conversation.favorite));
+      const stages = el('select', { class: `stage-select stage-${conversation.stage || 'new'}`, 'aria-label': `Этап: ${name}`, onclick: event => event.stopPropagation(), onkeydown: event => event.stopPropagation(), onchange: event => { event.stopPropagation(); this.patchConversation(conversation, { stage: stages.value }, stages); } }, Object.entries(CONVERSATION_STAGES).map(([value, label]) => el('option', { value }, label)));
+      stages.value = conversation.stage || 'new';
+      favorite.disabled = stages.disabled = this._conversationMutations.has(conversation.id);
+      const timestamp = conversation.last_activity_at || conversation.last_message_at;
+      const unread = Number(conversation.unread_count || 0);
+      const row = el('tr', { class: `inbox-row${conversation.id === this._selectedConversation ? ' selected' : ''}${unread ? ' unread' : ''}`, 'data-conversation-id': conversation.id, tabindex: '0', 'aria-label': `${name}, ${CHANNEL_LABELS[channel] || channel}, ${conversation.account_label || account?.label || ''}`, onclick: () => this.selectConversation(conversation.id), onkeydown: event => { if (event.target !== event.currentTarget) return; if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); this.selectConversation(conversation.id); } } }, [el('td', { class: 'favorite-col' }, favorite), el('td', { class: 'customer-cell' }, el('div', { class: 'customer-content' }, [el('div', { class: 'avatar' }, initials(name)), el('div', { class: 'customer-copy' }, [el('div', { class: 'customer-name' }, [el('span', {}, name), unread ? el('span', { class: 'unread-badge', 'aria-label': `Непрочитанных: ${unread}` }, unread > 99 ? '99+' : unread) : null]), el('p', { class: 'customer-preview' }, [channelIcon(channel), el('span', {}, conversation.preview || conversation.last_message?.text || 'В этом диалоге пока нет сообщений')])])])), el('td', { class: 'channel-col' }, el('div', { class: 'table-channel' }, [channelIcon(channel), el('div', {}, [el('strong', {}, CHANNEL_LABELS[channel] || channel), el('span', {}, conversation.account_label || account?.label || '')])])), el('td', { class: 'activity-col' }, timestamp ? [el('time', { datetime: timestamp, title: dateLabel(timestamp) }, timeLabel(timestamp)), el('span', { class: 'table-date' }, shortDateLabel(timestamp))] : '—'), el('td', { class: 'stage-col' }, stages), el('td', { class: `waiting-col${conversation.waiting_since ? ' has-wait' : ''}`, title: conversation.waiting_since ? `С ${dateLabel(conversation.waiting_since)} ${timeLabel(conversation.waiting_since)}` : '' }, conversation.waiting_since ? [icon('clock', 13), waitingLabel(conversation.waiting_since)] : '—')]);
+      body.append(row);
+    }
+    this._conversationList.replaceChildren(el('table', { class: 'inbox-table', 'aria-label': 'Диалоги из всех мессенджеров' }, [head, body]));
+    if (!this._conversations.length) this._conversationList.append(emptyState(this._inboxQuery ? 'Диалоги не найдены' : 'Пока нет диалогов', this._inboxQuery ? 'Попробуйте другое имя, компанию или номер.' : 'Подключите аккаунт, загрузите доступную историю или начните новый диалог.', button(this._accounts.length ? 'Новый диалог' : 'Подключить канал', () => this._accounts.length ? this.openNewConversation() : this.openConnect(), '', 'plus'), true));
+    const offset = this._inboxOffset || 0, count = this._conversations.length;
+    const prev = button('Назад', () => { this._inboxOffset = Math.max(0, offset - this._inboxPageSize); this.loadInbox(); }, 'subtle', 'arrow'); prev.disabled = offset === 0;
+    const next = button('Далее', () => { this._inboxOffset = offset + this._inboxPageSize; this.loadInbox(); }, 'subtle'); next.disabled = !this._inboxHasMore;
+    this._conversationFooter.replaceChildren(el('span', {}, count ? `${offset + 1}–${offset + count} из ${this._inboxTotal} диалогов` : '0 диалогов'), el('div', { class: 'pagination-actions' }, [prev, next]));
   }
-  async selectConversation(id) {
+  closeChat() {
     if (this._composer && this._selectedConversation) this._drafts.set(this._selectedConversation, this._composer.value);
-    this._selectedConversation = id;
-    this._messages = [];
-    this._hasOlder = false;
-    this._messagesLoading = true;
-    this._workspace.classList.add('chat-open');
+    this._selectedConversation = null; this._activeConversation = null; this._messages = []; this._hasOlder = false;
+    this._workspace?.classList.remove('chat-open'); if (this._chatPanel) this._chatPanel.hidden = true;
+    this.renderConversations();
+  }
+  async selectConversation(id, supplied = null) {
+    const item = supplied || this._conversations.find(conversation => conversation.id === id) || (this._activeConversation?.id === id ? this._activeConversation : null);
+    if (!item) return;
+    if (this._composer && this._selectedConversation) this._drafts.set(this._selectedConversation, this._composer.value);
+    this._selectedConversation = id; this._activeConversation = item; this._selectedAccount = item.account_id;
+    this._messages = []; this._hasOlder = false; this._messagesLoading = true;
+    const generation = this._generation;
+    this._workspace.classList.add('chat-open'); this._chatPanel.hidden = false;
     this.renderConversations(); this.renderChat();
     try {
       const result = array(await this.api(`/api/conversations/${encodeURIComponent(id)}/messages?limit=100`));
-      if (this._selectedConversation !== id) return;
+      if (this._selectedConversation !== id || generation !== this._generation) return;
       this._messages = result; this._hasOlder = result.length >= 100; this._messagesLoading = false; this.renderMessages(true);
-    } catch (error) { if (this._selectedConversation === id) { this._messagesLoading = false; this.renderMessages(); this.showError(error.message); } }
+    } catch (error) { if (this._selectedConversation === id && generation === this._generation) { this._messagesLoading = false; this.renderMessages(); this.showError(error.message); } }
+  }
+  async markVisibleMessagesRead() {
+    const id = this._selectedConversation, list = this._messageList, generation = this._generation;
+    if (!id || !list?.isConnected || document.hidden || this._modal || !this._workspace.classList.contains('chat-open') || this._reading.has(id)) return;
+    const bounds = list.getBoundingClientRect(); if (!bounds.height || !bounds.width) return;
+    const visible = [...list.querySelectorAll('[data-message-id][data-message-direction="inbound"][data-read-eligible="true"]')].filter(node => { const box = node.getBoundingClientRect(); return box.bottom > bounds.top && box.top < bounds.bottom; }).map(node => Number(node.dataset.messageId)).filter(Number.isSafeInteger);
+    const lastId = Math.max(0, ...visible); if (!lastId || lastId <= (this._lastRead.get(id) || 0)) return;
+    this._reading.add(id);
+    try {
+      const result = await this.post(`/api/conversations/${encodeURIComponent(id)}/read`, { last_message_id: lastId });
+      if (generation !== this._generation) return;
+      this._lastRead.set(id, Math.max(this._lastRead.get(id) || 0, Number(result.last_read_message_id || lastId)));
+      this.updateConversation({ id, unread_count: result.unread_count }); this.renderConversations();
+    } catch { /* Keep unread counts unchanged when the acknowledgement is unavailable. */ }
+    finally { this._reading.delete(id); }
   }
   renderChat() {
     this._composer = null;
@@ -321,15 +410,16 @@ export class OmniInbox extends HTMLElement {
     }
     const conversation = this.conversation;
     const account = this.account;
+    if (!account) { this.closeChat(); return; }
     const capability = this.capability(account.channel);
     this._chatHeaderState = el('span', { class: `status-dot ${stateColor(account.state)}` });
-    const header = el('header', { class: 'chat-header' }, [iconButton('arrow', 'К списку диалогов', () => this._workspace.classList.remove('chat-open'), 'mobile-back'), el('div', { class: 'avatar large' }, initials(conversation.title || conversation.peer)), el('div', { class: 'chat-heading' }, [el('h2', {}, conversation.title || conversation.peer), el('div', { class: 'chat-subtitle' }, [this._chatHeaderState, el('span', {}, `${CHANNEL_LABELS[account.channel] || account.channel} · ${conversation.peer}`)])]), modeBadge(capability, account.channel), iconButton('settings', 'Настроить аккаунт', () => this.openManageAccount(this.account))]);
+    const header = el('header', { class: 'chat-header' }, [iconButton('arrow', 'К списку диалогов', () => this.closeChat(), 'chat-back'), el('div', { class: 'avatar large' }, initials(conversation.title || conversation.peer)), el('div', { class: 'chat-heading' }, [el('h2', {}, conversation.title || conversation.peer), el('div', { class: 'chat-subtitle' }, [this._chatHeaderState, el('span', {}, `${CHANNEL_LABELS[account.channel] || account.channel} · ${conversation.peer}`)])]), modeBadge(capability, account.channel), iconButton('edit', 'Переименовать клиента', () => this.openRenameConversation()), iconButton('settings', 'Настроить аккаунт', () => this.openManageAccount(this.account))]);
     let notice = '';
     if (account.channel === 'demo') notice = 'Тестовый канал: сообщения не отправляются во внешние мессенджеры.';
     else if (account.channel === 'whatsapp_cloud') notice = 'Свободный текст доступен в течение 24 часов после сообщения клиента. Вне этого окна выберите одобренный шаблон.';
     else if (account.channel === 'max_bot') notice = 'Сообщения отправляются от бота компании. Клиент должен сначала начать диалог с ботом.';
     else if (capability?.mode && /experimental|unofficial/.test(capability.mode)) notice = 'Экспериментальная интеграция. Отслеживайте состояние подключения и подтверждение отправки.';
-    this._messageList = el('div', { class: 'messages', role: 'log', 'aria-label': 'История сообщений', 'aria-live': 'polite', 'aria-relevant': 'additions' });
+    this._messageList = el('div', { class: 'messages', role: 'log', 'aria-label': 'История сообщений', 'aria-live': 'polite', 'aria-relevant': 'additions', onscroll: () => { clearTimeout(this._readTimer); this._readTimer = setTimeout(() => this.markVisibleMessagesRead(), 150); } });
     this._composer = el('textarea', { class: 'composer', rows: 2, placeholder: 'Напишите сообщение…', 'aria-label': 'Текст сообщения', oninput: () => { this._drafts.set(conversation.id, this._composer.value); this.updateSendButton(); }, onkeydown: event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); this.sendMessage(); } } });
     this._composer.value = this._drafts.get(conversation.id) || '';
     this._sendButton = button('Отправить', () => this.sendMessage(), 'primary', 'send');
@@ -381,12 +471,13 @@ export class OmniInbox extends HTMLElement {
       const outbound = ['outbound', 'out', 'outgoing'].includes(message.direction);
       const status = MESSAGE_STATUSES[message.status] ?? message.status;
       const content = el('div', { class: 'message' }, [el('div', { class: 'message-text' }, message.text || '[Сообщение без текста]'), el('div', { class: `message-meta ${message.status}` }, [el('time', { datetime: message.created_at || '' }, timeLabel(message.created_at)), outbound ? el('span', {}, status) : null, outbound && ['sent', 'delivered', 'read'].includes(message.status) ? icon(message.status === 'sent' ? 'check' : 'checks', 12) : null]), message.error ? el('div', { class: 'message-error' }, typeof message.error === 'string' ? message.error : JSON.stringify(message.error)) : null, outbound && message.status === 'uncertain' ? el('div', { class: 'message-error' }, 'Проверьте чат в мессенджере перед повторной отправкой.') : null]);
-      nodes.push(el('div', { class: `message-row${outbound ? ' outbound' : ''}` }, content));
+      nodes.push(el('div', { class: `message-row${outbound ? ' outbound' : ''}`, 'data-message-id': message.id, 'data-message-direction': outbound ? 'outbound' : 'inbound', 'data-read-eligible': !outbound && message.read_eligible === true ? 'true' : 'false' }, content));
     }
     if (!nodes.length) nodes.push(emptyState(this._messagesLoading ? 'Загружаем историю' : 'Начните разговор', this._messagesLoading ? 'Получаем сохранённые сообщения…' : 'Сообщения этого диалога появятся здесь.', null, true));
     list.replaceChildren(...nodes);
     if (scrollToBottom || nearBottom) list.scrollTop = list.scrollHeight;
     else list.scrollTop = oldTop;
+    requestAnimationFrame(() => this.markVisibleMessagesRead());
   }
   async loadOlder() {
     if (this._loadingOlder || !this._messages.length) return;
@@ -458,20 +549,19 @@ export class OmniInbox extends HTMLElement {
   async refresh() {
     if (this._refreshing || !this._identity || !this.isConnected) return;
     this._refreshing = true;
-    const accountId = this._selectedAccount, conversationId = this._selectedConversation, generation = this._generation;
+    const conversationId = this._selectedConversation, generation = this._generation;
     try {
-      const requests = [this.api('/api/accounts')];
-      if (accountId) requests.push(this.api(`/api/conversations?account_id=${encodeURIComponent(accountId)}`));
+      const requests = [this.api('/api/accounts'), this.loadInbox(true)];
       if (conversationId) requests.push(this.api(`/api/conversations/${encodeURIComponent(conversationId)}/messages?limit=100`));
       const results = await Promise.all(requests);
       if (generation !== this._generation) return;
       this._accounts = array(results[0]); this.renderAccounts(); this._modalRefresh?.();
-      if (accountId === this._selectedAccount && accountId) { this._conversations = array(results[1]); this.renderConversations(); }
       if (conversationId === this._selectedConversation && conversationId) {
         const fresh = array(results[2]);
-        const freshIds = new Set(fresh.map(m => m.id));
-        const merged = [...this._messages.filter(m => !freshIds.has(m.id)), ...fresh].sort((a, b) => (date(a.created_at)?.getTime() || 0) - (date(b.created_at)?.getTime() || 0) || Number(a.id) - Number(b.id));
+        const freshIds = new Set(fresh.map(message => message.id));
+        const merged = [...this._messages.filter(message => !freshIds.has(message.id)), ...fresh].sort((a, b) => (date(a.created_at)?.getTime() || 0) - (date(b.created_at)?.getTime() || 0) || Number(a.id) - Number(b.id));
         if (JSON.stringify(merged) !== JSON.stringify(this._messages)) { this._messages = merged; this.renderMessages(); }
+        else this.markVisibleMessagesRead();
         if (this._chatHeaderState && this.account) this._chatHeaderState.className = `status-dot ${stateColor(this.account.state)}`;
       }
       this._connectionLabel.textContent = 'Обновлено ' + timeLabel(new Date().toISOString());
@@ -926,36 +1016,136 @@ export class OmniInbox extends HTMLElement {
         : 'Подключение пока не подтвердилось. Нажмите «Проверить выполнение запроса», чтобы узнать результат. Повторный запрос входа не отправляется.');
     } finally { this._jobs.delete(key); }
   }
-  openNewConversation() {
-    const account = this.account;
-    if (!account) { this.openConnect(); return; }
-    const hints = {
-      telegram: ['Username, телефон или ID Telegram', '@username или +79991234567', 'Для существующих диалогов используйте синхронизацию. Доступность нового получателя зависит от Telegram.'],
-      whatsapp_cloud: ['Телефон клиента', '79991234567', 'Номер в международном формате. Если клиент ещё не писал компании или прошло 24 часа, выберите «Одобренный шаблон» в форме отправки.'],
-      whatsapp_web: ['Телефон клиента', '79991234567', 'Рабочий номер должен быть подключён через связанные устройства.'],
-      max_bot: ['ID чата MAX', '123456789', 'Бот может писать клиенту после того, как клиент сам начал диалог.'],
-      max_personal: ['Телефон, пользователь или чат MAX', '+79991234567', 'Для первого контакта: +79991234567 или phone:+79991234567. Для известного пользователя: user:123456. Число без префикса — ID чата. Если номер скрыт или не найден, провайдер вернёт ошибку до отправки.'],
-      sms_gateway: ['Телефон клиента', '+79991234567', 'SMS отправляется с SIM-карты подключённого Android-устройства.'],
-      demo: ['Идентификатор тестового клиента', 'client-001', 'Внешние сообщения в демо-канале не отправляются.'],
-    };
-    const [peerLabel, placeholder, help] = hints[account.channel] || ['Получатель', '', 'Укажите идентификатор получателя.'];
-    const content = this.openModal('Новый диалог', `Отправитель: ${account.label}`);
-    const peer = this.field('peer', peerLabel, 'text', true, placeholder);
-    const title = this.field('title', 'Имя клиента', 'text', false, 'Например, Александр Смирнов');
-    const error = this.formError();
-    const submit = el('button', { type: 'submit', class: 'button primary' }, 'Открыть диалог');
+  openRenameConversation() {
+    const conversation = this.conversation; if (!conversation) return;
+    const content = this.openModal('Имя клиента или компания', 'Название используется для поиска в CRM. Получатель и рабочий аккаунт остаются прежними.');
+    const modal = this._modal;
+    const title = this.field('conversation-title', 'Имя клиента или компания', 'text', true, 'ООО Ромашка'); title.input.value = conversation.title || ''; title.input.maxLength = 256;
+    const error = this.formError(); const submit = el('button', { type: 'submit', class: 'button primary' }, 'Сохранить');
     content.append(el('form', { onsubmit: async event => {
-      event.preventDefault(); submit.disabled = true; error.hidden = true;
+      event.preventDefault(); if (submit.disabled || !title.input.value.trim()) return; submit.disabled = true; error.hidden = true;
       try {
-        const conversation = await this.post('/api/conversations', { account_id: account.id, peer: peer.input.value.trim(), title: title.input.value.trim() || peer.input.value.trim() });
-        this.closeModal();
-        if (account.id !== this._selectedAccount) await this.selectAccount(account.id);
-        this._conversations = [...this._conversations.filter(c => c.id !== conversation.id), conversation];
-        this.renderConversations(); await this.selectConversation(conversation.id);
-        this._composer?.focus();
-      } catch (e) { error.textContent = e.message; error.hidden = false; submit.disabled = false; }
-    } }, [peer.node, el('p', { class: 'provider-description' }, help), title.node, error, el('div', { class: 'form-actions' }, [button('Отмена', () => this.closeModal()), submit])]));
-    peer.input.focus();
+        const result = await this.api(`/api/conversations/${encodeURIComponent(conversation.id)}`, { method: 'PATCH', body: JSON.stringify({ title: title.input.value.trim() }) });
+        if (modal !== this._modal) return; this.updateConversation(result); this.closeModal(); this.renderConversations(); if (this._selectedConversation === conversation.id) this.renderChat();
+      } catch (e) { if (modal === this._modal) { error.textContent = e.message; error.hidden = false; submit.disabled = false; } }
+    } }, [title.node, error, el('div', { class: 'form-actions' }, [button('Отмена', () => this.closeModal()), submit])]));
+    title.input.focus(); title.input.select();
+  }
+  openNewConversation() {
+    if (!this._accounts.length) { this.openConnect(); return; }
+    const content = this.openModal('Новый диалог', 'Найдите клиента или компанию, затем выберите мессенджер и рабочий аккаунт.');
+    this._modal.querySelector('.modal').classList.add('recipient-modal');
+    const modal = this._modal, generation = this._generation;
+    const alive = () => this._modal === modal && this._generation === generation;
+    let request = 0, timer, offset = 0, chosen = null, routes = [];
+    const search = this.field('recipient-search', 'Клиент или компания', 'text', false, 'Например, ООО Ромашка');
+    const channel = el('select', { 'aria-label': 'Мессенджер получателя' }, [el('option', { value: '' }, 'Все мессенджеры'), ...[...new Set(this._accounts.map(account => account.channel))].map(value => el('option', { value }, CHANNEL_LABELS[value] || value))]);
+    const account = el('select', { 'aria-label': 'Аккаунт отправителя' });
+    const list = el('div', { class: 'recipient-results', 'aria-label': 'Найденные диалоги' });
+    const pagination = el('div', { class: 'recipient-pagination' });
+    const status = el('div', { class: 'job-status', role: 'status' });
+    const selection = el('p', { class: 'recipient-selection', hidden: true });
+    const submit = button('Открыть диалог', async () => { if (!chosen) return; const route = chosen; this.closeModal(); await this.selectConversation(route.id, route); this._composer?.focus(); }, 'primary'); submit.disabled = true;
+    const resetSelection = () => { chosen = null; routes = []; submit.disabled = true; selection.hidden = true; list.replaceChildren(); pagination.replaceChildren(); };
+    const renderAccounts = () => { account.replaceChildren(el('option', { value: '' }, 'Все рабочие аккаунты'), ...this._accounts.filter(item => !channel.value || item.channel === channel.value).map(item => el('option', { value: item.id }, `${item.label} · ${CHANNEL_LABELS[item.channel] || item.channel}`))); };
+    const renderRoutes = () => {
+      list.replaceChildren(...routes.map(route => {
+        const owner = this._accounts.find(item => item.id === route.account_id);
+        const messenger = route.channel || owner?.channel;
+        return el('button', { type: 'button', class: `recipient-route${chosen?.id === route.id ? ' selected' : ''}`, 'aria-pressed': String(chosen?.id === route.id), onclick: () => {
+          chosen = route; submit.disabled = false; selection.hidden = false;
+          selection.textContent = `Открыть ${route.title || route.peer} в ${CHANNEL_LABELS[messenger] || messenger} от аккаунта «${route.account_label || owner?.label || ''}»`;
+          renderRoutes();
+        } }, [el('div', { class: 'avatar' }, initials(route.title || route.peer)), el('div', { class: 'recipient-route-copy' }, [el('strong', {}, route.title || route.peer), el('span', {}, route.peer), el('small', {}, `${CHANNEL_LABELS[messenger] || messenger} · ${route.account_label || owner?.label || ''}`)]), channelIcon(messenger), chosen?.id === route.id ? icon('check', 17) : null]);
+      }));
+      if (!routes.length) list.append(emptyState('Сохранённых диалогов не найдено', 'Уточните название или номер. Для нового клиента укажите телефон или username.', null, true));
+    };
+    const load = async () => {
+      const current = ++request;
+      status.textContent = 'Ищем диалоги…';
+      const params = new URLSearchParams({ q: search.input.value.trim(), limit: '20', offset: String(offset) });
+      if (channel.value) params.set('channel', channel.value);
+      if (account.value) params.set('account_id', account.value);
+      try {
+        const result = await this.api(`/api/recipients?${params}`);
+        if (!alive() || current !== request) return;
+        routes = array(result); status.textContent = `Найдено диалогов: ${result.total ?? routes.length}`; renderRoutes();
+        const previous = button('Назад', () => { offset = Math.max(0, offset - 20); resetSelection(); load(); }, 'subtle'); previous.disabled = !offset;
+        const next = button('Далее', () => { offset += 20; resetSelection(); load(); }, 'subtle'); next.disabled = !result.has_more;
+        pagination.replaceChildren(previous, el('span', {}, routes.length ? `${offset + 1}–${offset + routes.length}` : '0'), next);
+      } catch (error) { if (alive() && current === request) status.replaceChildren(el('span', {}, error.message), button('Повторить поиск', load, 'subtle', 'refresh')); }
+    };
+    search.input.addEventListener('input', () => { resetSelection(); offset = 0; request += 1; clearTimeout(timer); timer = setTimeout(load, 250); });
+    channel.addEventListener('change', () => { resetSelection(); offset = 0; renderAccounts(); load(); });
+    account.addEventListener('change', () => { resetSelection(); offset = 0; load(); });
+    renderAccounts();
+    content.append(search.node, el('div', { class: 'recipient-filters' }, [el('label', { class: 'field' }, [el('span', {}, 'Мессенджер'), channel]), el('label', { class: 'field' }, [el('span', {}, 'Рабочий аккаунт'), account])]), status, list, pagination, selection, el('div', { class: 'form-actions' }, [button('Новый получатель по номеру или username', () => this.openDirectConversation(search.input.value.trim()), 'subtle'), submit]));
+    this._modalCleanup = () => clearTimeout(timer);
+    load(); search.input.focus();
+  }
+  openDirectConversation(suggestedTitle = '') {
+    const content = this.openModal('Новый получатель', 'Выберите, откуда написать, и укажите номер или username клиента.');
+    const modal = this._modal, generation = this._generation;
+    const channels = [...new Set(this._accounts.map(account => account.channel))];
+    const channel = el('select', { 'aria-label': 'Мессенджер нового диалога', required: true }, [el('option', { value: '' }, 'Выберите мессенджер'), ...channels.map(value => el('option', { value }, CHANNEL_LABELS[value] || value))]);
+    const sender = el('select', { 'aria-label': 'Рабочий аккаунт нового диалога', required: true, disabled: true }, el('option', { value: '' }, 'Выберите аккаунт'));
+    const peer = this.field('peer', 'Телефон или username клиента', 'text', true, '+79991234567 или @username'); peer.input.disabled = true;
+    const title = this.field('title', 'Имя клиента или компания', 'text', false, 'ООО Ромашка'); title.input.value = suggestedTitle; title.input.maxLength = 256;
+    const help = el('p', { class: 'field-help recipient-help' }, 'Для существующего диалога можно найти клиента по имени в предыдущем окне.');
+    const error = this.formError(); let busy = false;
+    const submit = el('button', { type: 'submit', class: 'button primary', disabled: true }, 'Открыть диалог');
+    const hints = { telegram: '@username или телефон +79991234567', whatsapp_web: 'Телефон в международном формате: +79991234567', whatsapp_cloud: 'Телефон в международном формате: +79991234567', max_personal: 'Телефон +79991234567, user:123456 или ID существующего чата', max_bot: 'ID чата MAX. Клиент должен сначала написать боту.', sms_gateway: 'Телефон в международном формате: +79991234567', demo: 'Идентификатор тестового клиента, например client-001' };
+    channel.addEventListener('change', () => { sender.replaceChildren(el('option', { value: '' }, 'Выберите аккаунт'), ...this._accounts.filter(account => account.channel === channel.value).map(account => el('option', { value: account.id }, `${account.label} · ${stateLabel(account.state)}`))); sender.disabled = !channel.value; peer.input.disabled = true; submit.disabled = true; help.textContent = hints[channel.value] || ''; });
+    sender.addEventListener('change', () => { peer.input.disabled = !sender.value; submit.disabled = !sender.value; });
+    content.append(el('form', { onsubmit: async event => {
+      event.preventDefault(); if (busy || submit.disabled) return; const account = this._accounts.find(item => item.id === sender.value && item.channel === channel.value); if (!account) return;
+      busy = true; submit.disabled = true; channel.disabled = true; sender.disabled = true; peer.input.disabled = true; title.input.disabled = true; error.hidden = true;
+      try {
+        const conversation = await this.post('/api/conversations', { account_id: account.id, peer: peer.input.value.trim(), title: title.input.value.trim() });
+        if (modal !== this._modal || generation !== this._generation) return;
+        this.closeModal(); await this.selectConversation(conversation.id, { ...conversation, channel: account.channel, account_label: account.label, account_state: account.state }); this.loadInbox(true); this._composer?.focus();
+      } catch (e) { if (modal === this._modal) { busy = false; channel.disabled = false; sender.disabled = false; peer.input.disabled = false; title.input.disabled = false; error.textContent = e.message; error.hidden = false; submit.disabled = false; } }
+    } }, [el('div', { class: 'recipient-filters' }, [el('label', { class: 'field' }, [el('span', {}, 'Мессенджер'), channel]), el('label', { class: 'field' }, [el('span', {}, 'Рабочий аккаунт'), sender])]), peer.node, help, title.node, error, el('div', { class: 'form-actions' }, [button('К поиску клиентов', () => this.openNewConversation()), submit])]));
+  }
+  openHistoryImport() {
+    const eligible = this._accounts.filter(account => account.state === 'connected' && ['telegram', 'whatsapp_web', 'max_personal'].includes(account.channel));
+    const content = this.openModal('Загрузить историю', 'Импорт доступных диалогов и сообщений из рабочего аккаунта.');
+    const modal = this._modal, generation = this._generation, alive = () => modal === this._modal && generation === this._generation;
+    const sender = el('select', { 'aria-label': 'Аккаунт для загрузки истории', required: true }, [el('option', { value: '' }, 'Выберите рабочий аккаунт'), ...eligible.map(account => el('option', { value: account.id }, `${account.label} · ${CHANNEL_LABELS[account.channel]}`))]);
+    if (eligible.some(account => account.id === this._filterAccountId)) sender.value = this._filterAccountId;
+    const depth = el('select', { 'aria-label': 'Период истории' }, [el('option', { value: '30' }, 'Последние 30 дней'), el('option', { value: '365' }, 'Последний год'), el('option', { value: '3650' }, 'Доступная история за последние 10 лет')]); depth.value = '3650';
+    const status = el('div', { class: 'history-progress', role: 'status', 'aria-live': 'polite' });
+    const error = this.formError(); let busy = false;
+    const submit = button('Загрузить историю', async () => {
+      if (busy || !sender.value) return; busy = true; submit.disabled = true; sender.disabled = true; depth.disabled = true; error.hidden = true;
+      const id = sender.value;
+      try {
+        let jobId = this._historyJobs.get(id);
+        if (!jobId) { const job = await this.post(`/api/accounts/${encodeURIComponent(id)}/actions`, { action: 'history', payload: { history_days: Number(depth.value) } }); jobId = job.id || job.job_id; if (!jobId) throw new Error('Сервер не вернул идентификатор запроса истории.'); this._historyJobs.set(id, jobId); }
+        await this.pollJob(jobId, () => { if (alive()) status.textContent = 'Сервер готовит загрузку истории…'; }, alive);
+        this._historyJobs.delete(id);
+        const accounts = array(await this.api('/api/accounts')); if (!alive()) return;
+        this._accounts = accounts; status.textContent = 'Запрос принят. Загружаем доступную историю…'; renderProgress(); await this.loadInbox(true);
+      } catch (e) { if (e.jobFailed) this._historyJobs.delete(id); if (alive()) { error.textContent = ['history_not_supported', 'history_sync_not_supported'].includes(e.message) ? 'Этот канал не поддерживает загрузку истории.' : e.message === 'account_not_connected' ? 'Сначала подключите рабочий аккаунт.' : e.message; error.hidden = false; } }
+      finally { if (alive()) { busy = false; sender.disabled = false; depth.disabled = false; renderProgress(); } }
+    }, 'primary');
+    const renderProgress = () => {
+      const account = this._accounts.find(item => item.id === sender.value), progress = account?.public?.history_sync;
+      if (!busy && progress) {
+        const done = Number(progress.chats_completed || 0), total = Number(progress.chats_discovered || 0);
+        const title = progress.state === 'complete' ? 'Загрузка доступной истории завершена.' : progress.state === 'partial' ? 'Загружена доступная часть истории.' : 'История загружается…';
+        const finished = ['complete', 'partial'].includes(progress.state);
+        const detail = progress.reason === 'waha_device_history_only' ? finished ? 'Загружена доступная на подключённом устройстве история.' : 'WhatsApp передаёт историю с подключённого устройства.' : progress.reason === 'max_catalog_pagination_unavailable' ? finished ? 'История найденных чатов загружена; MAX может передать не все старые чаты.' : 'MAX передаёт историю найденных чатов; некоторые старые чаты могут быть недоступны.' : progress.reason === 'history_fetch_failed' ? 'Не удалось загрузить часть истории. Повторите загрузку; сохранённые сообщения останутся в CRM.' : '';
+        status.replaceChildren(el('strong', {}, title), el('span', {}, `Обработано диалогов: ${done}${total ? ` из ${total}` : ''}`), detail ? el('span', {}, detail) : null);
+      }
+      const sameImport = progress?.state === 'importing' && Number(progress.history_days) === Number(depth.value);
+      submit.disabled = busy || !sender.value || (sameImport && !this._historyJobs.has(sender.value));
+      if (!busy) submit.textContent = this._historyJobs.has(sender.value) ? 'Проверить запрос истории' : sameImport ? 'История загружается…' : 'Загрузить историю';
+    };
+    sender.addEventListener('change', () => { status.textContent = ''; error.hidden = true; renderProgress(); });
+    depth.addEventListener('change', renderProgress);
+    content.append(el('label', { class: 'field' }, [el('span', {}, 'Рабочий аккаунт'), sender]), el('label', { class: 'field' }, [el('span', {}, 'Период'), depth]), el('p', { class: 'provider-description' }, 'Мессенджер определяет, какая история доступна. Импорт идёт в фоне; окно можно закрыть. Уже сохранённые сообщения останутся в CRM.'), status, error, el('div', { class: 'form-actions' }, [button('Закрыть', () => this.closeModal()), submit]));
+    this._modalRefresh = renderProgress; renderProgress();
   }
   openDemoInbound() {
     const id = this._selectedConversation;

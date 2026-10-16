@@ -20,7 +20,8 @@ from .capabilities import adapter_for
 from .config import settings
 from .db import Account, Base, Conversation, Job, Message, Session, ShardLease, engine, now
 from .security import seal, unseal
-from .services import advance_status, aware, ingest, reconcile_receipts
+from .services import (advance_status, aware, discard_message_metadata, ingest,
+                       reconcile_receipts, record_message_sent)
 
 log = logging.getLogger("omnicrm.worker")
 SHARD_COUNT = int(os.getenv("WORKER_SHARD_COUNT", "16"))
@@ -28,6 +29,26 @@ SHARDS = [int(x) for x in os.getenv("WORKER_SHARDS", ",".join(map(str, range(SHA
 INTERVAL = float(os.getenv("ACCOUNT_POLL_SECONDS", "3"))
 AUTH_JOB_TIMEOUT = 90
 WHATSAPP_LATE_AUTH_INTERVAL = 15
+
+
+def history_public(config):
+    """Expose counts only, never provider cursors, peers or session material."""
+    value = config.get("history_status")
+    if not isinstance(value, dict) or value.get("state") not in {"importing", "complete", "partial"}:
+        return None
+    result = {"state": value["state"]}
+    for key in ("chats_discovered", "chats_completed", "history_days"):
+        if type(value.get(key)) is int and 0 <= value[key] <= 10000000:
+            result[key] = value[key]
+    if value.get("reason") in {"max_catalog_pagination_unavailable", "waha_device_history_only", "history_fetch_failed"}:
+        result["reason"] = value["reason"]
+    return result
+
+
+def publish_history(account, config):
+    progress = history_public(config)
+    if progress is not None:
+        account.public = {**(account.public or {}), "history_sync": progress}
 
 
 class OwnershipLost(RuntimeError):
@@ -171,7 +192,12 @@ async def process_job(account_id, adapter, ownership):
             return True
         job.status = "running"
         job_id, action, payload = job.id, job.action, unseal(job.encrypted_payload)
-        max_auth = db.get(Account, account_id).channel == "max_personal"
+        account = db.get(Account, account_id)
+        max_auth = account.channel == "max_personal"
+        if action == "history" and account.state != "connected":
+            job.status, job.error, job.encrypted_payload = "failed", "account_not_connected", None
+            payload.clear()
+            return True
         # Auth codes/passwords never survive a completed or interrupted job.
         job.encrypted_payload = None
     ownership.check()
@@ -182,15 +208,20 @@ async def process_job(account_id, adapter, ownership):
         async with asyncio.timeout(AUTH_JOB_TIMEOUT):
             # MAX auth owns its bootstrap: it must handle an expired token on
             # explicit login and revoke an accidentally linked other identity.
-            if not max_auth:
+            if not max_auth and action != "history":
                 await adapter.start()
             ownership.check()
-            result = await adapter.auth(action, payload)
+            if action == "history":
+                result = await adapter.request_history(payload)
+            else:
+                result = await adapter.auth(action, payload)
         ownership.check()
         with Session.begin() as db:
             fence_transaction(db, ownership, account_id)
             a = db.scalar(select(Account).where(Account.id == account_id).with_for_update())
-            a.state, a.public = result.state, result.public
+            if action != "history":
+                a.state, a.public = result.state, result.public
+            publish_history(a, adapter.config)
             a.encrypted_config, a.updated_at = seal(adapter.config), now()
             db.get(Job, job_id).status = "done"
             if action == "disconnect":
@@ -202,6 +233,7 @@ async def process_job(account_id, adapter, ownership):
     except Exception as exc:
         ownership.check()
         code = (exc.code if isinstance(exc, ProviderError) else
+                ("history_request_timeout" if isinstance(exc, TimeoutError) else "history_request_failed") if action == "history" else
                 "provider_auth_timeout" if isinstance(exc, TimeoutError) else "provider_auth_error")
         with Session.begin() as db:
             fence_transaction(db, ownership, account_id)
@@ -209,7 +241,10 @@ async def process_job(account_id, adapter, ownership):
             job.status, job.error = "failed", code[:96]
             a = db.get(Account, account_id)
             a.encrypted_config, a.updated_at = seal(adapter.config), now()
-            a.public = auth_error_public(a, code)
+            if action == "history":
+                a.public = {**(a.public or {}), "history_sync": {"state": "partial", "error": code[:96]}}
+            else:
+                a.public = auth_error_public(a, code)
             if auth_expired(exc):
                 a.state = "reauth_required"
         log.warning("auth_failed account=%s code=%s", account_id, code)
@@ -250,10 +285,12 @@ async def process_outbox(account_id, adapter, ownership):
                 rank = {"sent": 1, "failed": 2, "delivered": 3, "read": 4}
                 if rank.get(echo.status, 0) > rank.get(status, 0):
                     status = echo.status
+                discard_message_metadata(db, echo)
                 db.delete(echo)
                 db.flush()
             m.provider_id, m.status, m.error = str(provider_id), status, None
             reconcile_receipts(db, a, m, peer)
+            record_message_sent(db, m)
             a.encrypted_config, a.updated_at = seal(adapter.config), now()
     except OwnershipLost:
         raise
@@ -291,6 +328,7 @@ async def poll_account(account_id, adapter, ownership):
         a = db.scalar(select(Account).where(Account.id == account_id).with_for_update())
         for event in events:
             ingest(db, a, event)
+        publish_history(a, adapter.config)
         a.encrypted_config, a.updated_at = seal(adapter.config), now()
 
 

@@ -5,6 +5,7 @@ import re
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
+from typing import Literal
 from uuid import UUID, uuid4
 
 import jwt
@@ -20,9 +21,10 @@ from sqlalchemy.orm import Session
 
 from .capabilities import capabilities
 from .config import settings
-from .db import Account, Base, Conversation, IntegrationSetting, Job, Message, WebhookReceipt, engine, now, session_dependency
+from .db import Account, Base, Conversation, ConversationRead, IntegrationSetting, Job, Message, MessageInbox, WebhookReceipt, engine, now, session_dependency
 from .security import Identity, identity, seal, unseal
-from .services import account_for, account_json, audit, aware, conversation_for, ingest, message_json
+from .services import (account_for, account_json, audit, aware, conversation_for,
+                       conversation_metadata, inbox_page, ingest, lock_account_for, message_json, refresh_search)
 
 
 @asynccontextmanager
@@ -83,6 +85,16 @@ class ConversationCreate(Body):
     account_id: str
     peer: str = Field(min_length=1, max_length=256)
     title: str = Field(default="", max_length=256)
+
+
+class ConversationPatch(Body):
+    stage: Literal["new", "in_progress", "done"] | None = None
+    favorite: bool | None = Field(default=None, strict=True)
+    title: str | None = Field(default=None, min_length=1, max_length=256)
+
+
+class ConversationReadBody(Body):
+    last_message_id: int = Field(gt=0, strict=True)
 
 
 class Send(Body):
@@ -267,11 +279,19 @@ def assign(account_id: str, body: Assign, user=Depends(identity), db: Session = 
 @app.post("/api/accounts/{account_id}/actions", status_code=202)
 def action(account_id: str, body: Action, user=Depends(identity), db: Session = Depends(session_dependency)):
     a = account_for(db, account_id, user)
-    if body.action not in {"login", "code", "password", "sync", "disconnect", "qr"}:
+    if body.action not in {"login", "code", "password", "sync", "disconnect", "qr", "history"}:
         raise HTTPException(422, "unsupported_action")
     if len(json.dumps(body.payload)) > 12000:
         raise HTTPException(422, "payload_too_large")
-    if a.channel == "max_personal":
+    if body.action == "history":
+        if a.channel not in {"telegram", "whatsapp_web", "max_personal"}:
+            raise HTTPException(422, "history_sync_not_supported")
+        if a.state != "connected":
+            raise HTTPException(409, "account_not_connected")
+        days = body.payload.get("history_days", 3650)
+        if set(body.payload) - {"history_days"} or type(days) is not int or not 1 <= days <= 3650:
+            raise HTTPException(422, "history_days_invalid")
+    elif a.channel == "max_personal":
         allowed = {"login": {"phone", "login_method"}, "qr": set(), "code": {"code"},
                    "password": {"password"}, "sync": set(), "disconnect": set()}[body.action]
         if set(body.payload) - allowed:
@@ -313,6 +333,66 @@ def conversations(account_id: str | None = None, user=Depends(identity), db: Ses
     return list(db.scalars(query.order_by(Conversation.last_message_at.desc().nullslast()).limit(500)))
 
 
+@app.get("/api/inbox")
+@app.get("/api/recipients")
+def inbox(q: str = Query("", max_length=256), account_id: str | None = None,
+          channel: str | None = Query(None, max_length=32), limit: int = Query(50, ge=1, le=200),
+          offset: int = Query(0, ge=0), user=Depends(identity), db: Session = Depends(session_dependency)):
+    # The directory consists of discovered conversations; same names across
+    # channels remain distinct account/peer destinations, never auto-merged.
+    return inbox_page(db, user, q=q, account_id=account_id, channel=channel, limit=limit, offset=offset)
+
+
+@app.patch("/api/conversations/{conversation_id}")
+def patch_conversation(conversation_id: str, body: ConversationPatch,
+                       user=Depends(identity), db: Session = Depends(session_dependency)):
+    c = conversation_for(db, conversation_id, user)
+    # Use the same lock as provider ingestion when creating additive metadata.
+    lock_account_for(db, c.account_id, user)
+    db.refresh(c)
+    if not body.model_fields_set or any(getattr(body, field) is None for field in body.model_fields_set):
+        raise HTTPException(422, "conversation_patch_empty_or_null")
+    metadata = conversation_metadata(db, c)
+    if body.title is not None:
+        if not body.title.strip():
+            raise HTTPException(422, "conversation_title_required")
+        c.title, metadata.title_custom = body.title.strip(), True
+    if body.stage is not None:
+        metadata.stage = body.stage
+    if body.favorite is not None:
+        metadata.favorite = body.favorite
+    refresh_search(metadata, c)
+    audit(db, user, "conversation.update", c.id)
+    db.flush()
+    item = inbox_page(db, user, conversation_id=c.id, limit=1)["items"][0]
+    db.commit()
+    return item
+
+
+@app.post("/api/conversations/{conversation_id}/read")
+def read_conversation(conversation_id: str, body: ConversationReadBody,
+                      user=Depends(identity), db: Session = Depends(session_dependency)):
+    c = conversation_for(db, conversation_id, user)
+    lock_account_for(db, c.account_id, user)
+    db.refresh(c)
+    visible = db.get(Message, body.last_message_id)
+    metadata = db.get(MessageInbox, body.last_message_id)
+    if (visible is None or visible.conversation_id != c.id or visible.direction != "inbound"
+            or metadata is None or metadata.historical):
+        raise HTTPException(422, "invalid_read_message")
+    row = db.get(ConversationRead, (c.id, user.sub))
+    if row is None:
+        row = ConversationRead(conversation_id=c.id, user_id=user.sub, last_message_id=body.last_message_id)
+        db.add(row)
+    else:
+        row.last_message_id = max(row.last_message_id, body.last_message_id)
+    db.flush()
+    item = inbox_page(db, user, conversation_id=c.id, limit=1)["items"][0]
+    db.commit()
+    return {"conversation_id": c.id, "last_read_message_id": row.last_message_id,
+            "unread_count": item["unread_count"]}
+
+
 @app.post("/api/conversations", status_code=201)
 def create_conversation(body: ConversationCreate, user=Depends(identity), db: Session = Depends(session_dependency)):
     account_for(db, body.account_id, user)
@@ -325,6 +405,10 @@ def create_conversation(body: ConversationCreate, user=Depends(identity), db: Se
     c = Conversation(account_id=body.account_id, peer=peer, title=body.title.strip() or peer)
     db.add(c)
     try:
+        db.flush()
+        metadata = conversation_metadata(db, c)
+        metadata.title_custom = bool(body.title.strip())
+        refresh_search(metadata, c)
         db.commit()
     except IntegrityError:
         db.rollback()
@@ -335,20 +419,21 @@ def create_conversation(body: ConversationCreate, user=Depends(identity), db: Se
 @app.get("/api/conversations/{conversation_id}/messages")
 def messages(conversation_id: str, before: int | None = None, limit: int = Query(100, ge=1, le=200), user=Depends(identity), db: Session = Depends(session_dependency)):
     conversation_for(db, conversation_id, user)
-    query = select(Message).where(Message.conversation_id == conversation_id)
+    query = select(Message, MessageInbox).outerjoin(MessageInbox).where(Message.conversation_id == conversation_id)
     if before is not None:
         cursor = db.get(Message, before)
         if not cursor or cursor.conversation_id != conversation_id:
             raise HTTPException(422, "invalid_message_cursor")
         query = query.where(or_(Message.created_at < cursor.created_at, and_(Message.created_at == cursor.created_at, Message.id < cursor.id)))
-    rows = list(db.scalars(query.order_by(Message.created_at.desc(), Message.id.desc()).limit(limit)))
-    return [message_json(m) for m in reversed(rows)]
+    rows = list(db.execute(query.order_by(Message.created_at.desc(), Message.id.desc()).limit(limit)))
+    return [message_json(m, metadata) for m, metadata in reversed(rows)]
 
 
 @app.post("/api/conversations/{conversation_id}/messages", status_code=202)
 def send(conversation_id: str, body: Send, user=Depends(identity), db: Session = Depends(session_dependency)):
     c = conversation_for(db, conversation_id, user)
-    a = account_for(db, c.account_id, user)
+    a = lock_account_for(db, c.account_id, user)
+    db.refresh(c)
     if body.template is not None:
         if a.channel != "whatsapp_cloud":
             raise HTTPException(422, "templates_only_for_whatsapp_cloud")
@@ -382,7 +467,7 @@ def send(conversation_id: str, body: Send, user=Depends(identity), db: Session =
         if not old or old.text != body.text or old.template != body.template:
             raise HTTPException(409, "idempotency_conflict")
         return message_json(old)
-    return message_json(m)
+    return message_json(m, db.get(MessageInbox, m.id))
 
 
 @app.get("/api/messages/{message_id}")
@@ -391,13 +476,14 @@ def get_message(message_id: int, user=Depends(identity), db: Session = Depends(s
     if not m:
         raise HTTPException(404)
     conversation_for(db, m.conversation_id, user)
-    return message_json(m)
+    return message_json(m, db.get(MessageInbox, m.id))
 
 
 @app.post("/api/demo/inbound")
 def demo_inbound(body: DemoInbound, user=Depends(identity), db: Session = Depends(session_dependency)):
     c = conversation_for(db, body.conversation_id, user)
-    a = account_for(db, c.account_id, user)
+    a = lock_account_for(db, c.account_id, user)
+    db.refresh(c)
     if not settings.demo or a.channel != "demo":
         raise HTTPException(404)
     from .adapters.base import Event

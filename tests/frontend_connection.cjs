@@ -66,6 +66,7 @@ const caps = (configured = true, maxMethods = ['qr', 'phone'], maxEnabled = true
         return reply({ id }, 202);
       }
       if (pathname.startsWith('/api/jobs/')) { data.jobReads++; return reply(data.jobs.get(pathname.split('/').pop())); }
+      if (pathname === '/api/inbox' || pathname === '/api/recipients') return reply({ items: [], total: 0, has_more: false });
       if (pathname === '/api/conversations') return reply([]);
       throw new Error('Unhandled mock API: ' + request.method() + ' ' + pathname);
     });

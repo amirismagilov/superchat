@@ -123,7 +123,9 @@ def test_waha_history_replays_after_crash_and_keeps_timestamp_ties(experimental)
     replay = run(poll(before))  # Simulated crash before committing config.
     assert [event.provider_id for event in first] == [event.provider_id for event in replay]
     second = run(poll(config))
-    assert len(first) == 100 and [event.provider_id for event in second] == ["100"]
+    assert len([event for event in first if not event.metadata.get("conversation_only")]) == 100
+    assert first[0].metadata["conversation_only"] and first[0].peer_name == "Customer"
+    assert [event.provider_id for event in second] == ["100"]
     assert first[0].peer == "7@c.us"
     assert pages == [0, 0, 100]
     assert "watermark" in config["_waha_cursors"]["7@c.us"]
@@ -249,7 +251,8 @@ def test_max_poll_replays_history_and_keeps_outbound_direction(max_module, exper
     first = run(adapter(config).poll())
     replay = run(adapter({}).poll())
     assert first == replay
-    assert first[0].direction == "outbound" and first[0].timestamp == 99
+    assert first[0].metadata["conversation_only"] and first[0].peer_name == "Customer"
+    assert first[1].direction == "outbound" and first[1].timestamp == 99
     assert config["_max_cursors"]["42"]["watermark"] == 40000
 
 
@@ -425,6 +428,8 @@ def test_waha_noweb_raw_send_id_matches_normalized_poll_history(experimental, ke
         if key["remoteJid"].endswith("@lid"):
             assert adapter.config["_waha_lid_pn"]["12345@lid"] == "79990000000@c.us"
         events = await adapter.poll()
+        assert events[0].metadata["conversation_only"]
+        events = [event for event in events if not event.metadata.get("conversation_only")]
         assert len(events) == 1 and events[0].provider_id == sent_id
         assert events[0].direction == "outbound"
         await adapter.close()
@@ -443,4 +448,126 @@ def test_waha_raw_send_missing_key_fields_remains_uncertain(experimental):
         assert caught.value.code == "waha_missing_message_id"
         await adapter.close()
 
+    run(exercise())
+
+
+def test_waha_discovers_more_than_first_batch_and_empty_chats_progress_after_restart(experimental):
+    chats = [{"id": f"{70000000000 + i}@c.us", "name": f"Contact {i}"} for i in range(25)]
+    offsets = []
+    def handler(request):
+        if request.url.path.endswith("/chats"):
+            offset = int(request.url.params["offset"])
+            offsets.append(offset)
+            return httpx.Response(200, json=chats[offset:offset + 10])
+        return httpx.Response(200, json=[])
+    async def exercise():
+        config = {"_waha_session": SESSION}
+        all_events = []
+        for _ in range(16):
+            value = WhatsAppWebAdapter(config)
+            value.http = httpx.AsyncClient(base_url="http://waha", transport=httpx.MockTransport(handler))
+            all_events.extend(await value.poll())
+            await value.close()
+            config = copy.deepcopy(config)
+        assert len({event.peer for event in all_events}) == 25
+        assert all(event.metadata["conversation_only"] and not event.text for event in all_events)
+        assert offsets[:3] == [0, 10, 20]
+        assert config["history_status"] == {"state": "complete", "chats_discovered": 25,
+            "chats_completed": 25, "history_days": 30, "reason": "waha_device_history_only"}
+    run(exercise())
+
+
+def test_waha_lid_in_catalog_still_resolves_and_catalog_failure_keeps_live(experimental, monkeypatch):
+    monkeypatch.setattr("app.adapters.whatsapp_web.time.time", lambda: 100)
+    lid_calls = []
+    fail_catalog = [False]
+    def handler(request):
+        if "/lids/" in request.url.path:
+            lid_calls.append(request.url.path)
+            return httpx.Response(200, json={"pn": "79990000000@s.whatsapp.net"})
+        if request.url.path.endswith("/chats"):
+            return httpx.Response(503, json={}) if fail_catalog[0] else httpx.Response(200, json=[{"id": "12345@lid", "name": "Customer"}])
+        return httpx.Response(200, json=[{"id": "reply", "from": "12345@lid", "body": "Hi", "timestamp": 101, "fromMe": False}])
+    async def exercise():
+        value = WhatsAppWebAdapter({"_waha_session": SESSION})
+        value.http = httpx.AsyncClient(base_url="http://waha", transport=httpx.MockTransport(handler))
+        events = await value.poll()
+        assert len(lid_calls) == 1
+        assert all(event.metadata["canonical_peer"] == "79990000000@c.us" for event in events)
+        assert next(event for event in events if event.provider_id).metadata["historical"] is False
+        fail_catalog[0] = True
+        value._live_seen = {}
+        events = await value.poll()
+        assert any(event.provider_id == "reply" for event in events)
+        assert value.config["history_status"]["state"] == "partial"
+        assert len(lid_calls) == 1
+        await value.close()
+    run(exercise())
+
+
+def test_max_refresh_discovers_empty_named_chats_outside_login_snapshot(max_module, experimental, monkeypatch):
+    monkeypatch.setattr(max_module.time, "time", lambda: 100)
+    chats = [NS(id=i, title=f"Contact {i}") for i in range(20, 35)]
+    client = NS(is_connected=True, chats=[], me=NS(contact=NS(id=11)),
+                fetch_chats=AsyncMock(return_value=chats), fetch_history=AsyncMock(return_value=[]))
+    async def exercise():
+        value = max_module.MaxPersonalAdapter({})
+        value.client = client
+        first = await value.poll()
+        assert len(first) == 15
+        assert all(event.metadata["conversation_only"] and event.peer_name.startswith("Contact") for event in first)
+        for _ in range(14):
+            await value.poll()
+        assert {call.kwargs["chat_id"] for call in client.fetch_history.await_args_list} == set(range(20, 35))
+        client.fetch_chats.assert_awaited_once()
+        assert value.config["history_status"] == {"state": "partial", "chats_discovered": 15,
+            "chats_completed": 15, "history_days": 30, "reason": "max_catalog_pagination_unavailable"}
+    run(exercise())
+
+
+def test_manual_history_preserves_provider_identity_aliases_and_live_state(max_module, experimental):
+    async def exercise():
+        wa_config = {"_waha_session": SESSION, "wa_self": {"id": "11"}, "_waha_lid_pn": {"1@lid": "7@c.us"},
+                     "_waha_cursors": {"7@c.us": {"watermark": 99}}, "_waha_catalog": {"7@c.us": {"name": "Name"}}}
+        wa = WhatsAppWebAdapter(wa_config)
+        wa._live_seen = {("7@c.us", "m"): ("retained",)}
+        await wa.request_history({"history_days": 3650})
+        assert wa_config["_waha_session"] == SESSION and wa_config["wa_self"] == {"id": "11"}
+        assert wa_config["_waha_lid_pn"] == {"1@lid": "7@c.us"} and wa._live_seen
+        assert "_waha_cursors" not in wa_config and wa_config["history_status"]["history_days"] == 3650
+        mx_config = {"max_self": {"id": "11"}, "session": "secret", "_max_peer_aliases": {"42": ["+79990000000"]},
+                     "_max_cursors": {"42": {"watermark": 99}}}
+        mx = max_module.MaxPersonalAdapter(mx_config)
+        mx._dirty_chats["42"] = 1
+        await mx.request_history({})
+        assert mx_config["session"] == "secret" and mx_config["max_self"] == {"id": "11"}
+        assert mx_config["_max_peer_aliases"]["42"] == ["+79990000000"] and mx._dirty_chats == {"42": 1}
+        assert "_max_cursors" not in mx_config and mx_config["history_status"]["history_days"] == 3650
+    run(exercise())
+
+
+def test_waha_unresolvable_lids_do_not_starve_later_peers(experimental):
+    lookups = []
+    live = [{"id": str(i), "from": peer, "body": "Hi", "timestamp": 100, "fromMe": False}
+            for i, peer in enumerate(["1@lid", "1@lid", "2@lid", "3@lid"])]
+    def handler(request):
+        if "/lids/" in request.url.path:
+            peer = request.url.path.rsplit("/", 1)[-1]
+            lookups.append(peer)
+            return httpx.Response(200, json={"pn": "79990000000@c.us"}) if peer == "3@lid" else httpx.Response(404)
+        if request.url.path.endswith("/chats"):
+            return httpx.Response(200, json=[{"id": peer} for peer in ("1@lid", "2@lid", "3@lid")])
+        return httpx.Response(200, json=live if "/all/" in request.url.path else [])
+    async def exercise():
+        value = WhatsAppWebAdapter({"_waha_session": SESSION})
+        value.http = httpx.AsyncClient(base_url="http://waha", transport=httpx.MockTransport(handler))
+        await value.poll()
+        assert lookups == ["1@lid", "2@lid"]
+        events = await value.poll()
+        assert lookups[2] == "3@lid"
+        assert value.config["_waha_lid_pn"]["3@lid"] == "79990000000@c.us"
+        assert next(event for event in events if event.provider_id == "3").metadata["canonical_peer"] == "79990000000@c.us"
+        assert any(event.peer == "3@lid" and event.metadata.get("conversation_only")
+                   and event.metadata["canonical_peer"] == "79990000000@c.us" for event in events)
+        await value.close()
     run(exercise())

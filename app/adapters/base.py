@@ -45,6 +45,10 @@ class Adapter:
     async def auth(self, action: str, payload: dict[str, Any]) -> AuthResult:
         raise ProviderError("unsupported_action")
 
+    async def request_history(self, payload: dict[str, Any]) -> AuthResult:
+        """Queue progressive import; never authenticate or send a message."""
+        raise ProviderError("history_not_supported")
+
     async def send(self, peer: str, text: str, client_id: str) -> str:
         raise ProviderError("unsupported_send")
 
@@ -53,3 +57,10 @@ class Adapter:
 
     async def close(self) -> None:
         pass
+
+
+def history_days(payload: dict[str, Any], default: int = 3650) -> int:
+    value = payload.get("history_days", default)
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 3650:
+        raise ProviderError("history_days_invalid")
+    return value

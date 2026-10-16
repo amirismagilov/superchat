@@ -13,7 +13,7 @@ import time
 import uuid
 from typing import Any
 
-from .base import Adapter, AuthResult, Event, ProviderError
+from .base import Adapter, AuthResult, Event, ProviderError, history_days
 
 
 def _qr_data_url(value: str) -> str:
@@ -491,76 +491,155 @@ class MaxPersonalAdapter(Adapter):
         self._known_chats.add(str(chat_id))
         return str(message.id)
 
+    def _history(self) -> dict:
+        if "_max_history" not in self.config:
+            self.config["_max_history"] = {"days": history_days(self.config, 30), "boundary": time.time(),
+                                           "completed": [], "catalog_after": 0}
+        return self.config["_max_history"]
+
+    async def request_history(self, payload: dict) -> AuthResult:
+        self.config["_max_history"] = {"days": history_days(payload), "boundary": time.time(),
+                                       "completed": [], "catalog_after": 0}
+        self.config.pop("_max_cursors", None)
+        self.config["_max_chat_offset"] = 0
+        self._history_status()
+        return AuthResult("connected")
+
+    def _history_status(self) -> None:
+        history = self._history()
+        count = len(self.config.get("_max_catalog", {}))
+        completed = len(history["completed"])
+        # PyMax's documented fetch_chats returns a page but drops any server
+        # continuation metadata. Do not pretend the known catalog is exhaustive.
+        self.config["history_status"] = {
+            "state": "partial" if history.get("error") or completed >= count else "importing",
+            "chats_discovered": count, "chats_completed": completed, "history_days": history["days"],
+            "reason": "max_catalog_pagination_unavailable",
+        }
+
+    def _chat_name(self, chat, own_id) -> str | None:
+        title = getattr(chat, "title", None)
+        if isinstance(title, str) and title.strip():
+            return title.strip()
+        participants = getattr(chat, "participants", {}) or {}
+        others = [int(value) for value in participants if str(value).lstrip("-").isdigit() and int(value) != own_id]
+        if len(others) != 1:
+            return None
+        contact = None
+        cached = getattr(self.client, "get_cached_user", None)
+        if callable(cached):
+            contact = cached(others[0])
+        if contact is None:
+            contact = next((value for value in (getattr(self.client, "contacts", []) or [])
+                            if value is not None and getattr(value, "id", None) == others[0]), None)
+        for name in getattr(contact, "names", []) or []:
+            value = getattr(name, "name", None) or " ".join(filter(None, (
+                getattr(name, "first_name", None), getattr(name, "last_name", None))))
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
     async def poll(self) -> list[Event]:
         await self.start()
         if not self.client or (self._connect_task and not self._connect_task.done()):
             return []
+        history = self._history()
         chats = {str(chat.id): chat for chat in (self.client.chats or [])}
+        history.pop("error", None)
+        fetch_chats = getattr(self.client, "fetch_chats", None)
+        if callable(fetch_chats) and time.time() >= history["catalog_after"]:
+            try:
+                # Documented SDK catalog refresh, beyond the initial login
+                # snapshot. No invented timestamp continuation is used.
+                batch = await asyncio.wait_for(fetch_chats(), 8)
+                chats.update({str(chat.id): chat for chat in batch})
+            except Exception:
+                history["error"] = True
+            history["catalog_after"] = time.time() + 60
+        catalog = self.config.setdefault("_max_catalog", {})
         self._known_chats.update(chats)
+        self._known_chats.update(catalog)
         self._known_chats.update(self.config.get("_max_cursors", {}))
         self._known_chats.update(self.config.get("_max_peer_aliases", {}))
         peers = sorted(self._known_chats)
-        if not peers:
-            return []
-        offset = int(self.config.get("_max_chat_offset", 0)) % len(peers)
-        scheduled = peers[offset:offset + self.CHATS_PER_POLL]
-        # Pushes choose which histories to refresh first, but are never the
-        # sole durable source. Keep the fair history round-robin progressing.
-        dirty = dict(self._dirty_chats)
-        urgent = sorted(dirty, key=dirty.get, reverse=True)[:self.CHATS_PER_POLL]
-        selected = list(dict.fromkeys(urgent + scheduled))
-        cursors = self.config.setdefault("_max_cursors", {})
         own_id = self.client.me.contact.id if self.client.me else None
         events = {}
+        for peer in peers:
+            name = self._chat_name(chats.get(peer), own_id) or catalog.get(peer, {}).get("name")
+            if peer not in catalog or name != catalog[peer].get("name"):
+                events[("conversation", peer)] = Event("", peer, "", peer_name=name, metadata={
+                    "conversation_only": True, "canonical_peer": peer,
+                    "aliases": self.config.get("_max_peer_aliases", {}).get(peer, []),
+                })
+            catalog[peer] = {"name": name}
+        if not peers:
+            self._history_status()
+            return list(events.values())
+        offset = int(self.config.get("_max_chat_offset", 0)) % len(peers)
+        scheduled = peers[offset:offset + 1]
+        # One urgent and one fair history slot bound RPC time and keep a large
+        # old backlog moving without starving chats with incoming messages.
+        dirty = dict(self._dirty_chats)
+        urgent = sorted(dirty, key=dirty.get, reverse=True)[:1]
+        selected = list(dict.fromkeys(urgent + scheduled))
+        cursors = self.config.setdefault("_max_cursors", {})
+        floor = max(0, int((history["boundary"] - history["days"] * 86400) * 1000))
         for peer in selected:
             cursor = cursors.setdefault(peer, {})
             now = int(time.time() * 1000)
-            days = min(max(int(self.config.get("history_days", 30)), 1), 3650)
-            history_floor = now - days * 86400000
             if "before" not in cursor:
-                cursor.update(floor=cursor.get("watermark", history_floor), ceiling=now, before=now)
-            try:
-                # A frozen backfill window must not hide incoming messages
-                # sent after its ceiling. Read the newest page independently.
-                latest = []
-                if cursor["before"] < now:
+                cursor.update(floor=cursor.get("watermark", floor), ceiling=now, before=now)
+            latest = []
+            if cursor["before"] < now:
+                try:
                     latest = await asyncio.wait_for(self.client.fetch_history(
                         chat_id=int(peer), backward=self.PAGE_SIZE, forward=0, from_time=now,
-                    ), 30)
+                    ), 6)
+                except Exception:
+                    history["error"] = True
+            history_failed = False
+            try:
                 messages = await asyncio.wait_for(self.client.fetch_history(
                     chat_id=int(peer), backward=self.PAGE_SIZE, forward=0, from_time=cursor["before"],
-                ), 30)
+                ), 6)
                 if cursor["before"] == now:
-                    latest = messages  # Same request also serves the independent live tail.
-            except Exception as exc:
-                raise ProviderError("max_history_failed") from exc
-            history = [message for message in messages if cursor["floor"] <= message.time <= cursor["ceiling"]]
-            for message in history + latest:
-                if message.time < history_floor:
+                    latest = messages
+            except Exception:
+                # A successful latest page must still commit when the frozen
+                # older page times out; retain the old cursor for its retry.
+                messages, history_failed = [], True
+                history["error"] = True
+            backfill = [message for message in messages if cursor["floor"] <= message.time <= cursor["ceiling"]]
+            for message in backfill + latest:
+                if message.time < floor:
                     continue
                 outbound = own_id is not None and message.sender == own_id
                 events[(peer, str(message.id))] = Event(
                     provider_id=str(message.id), peer=peer,
                     text=message.text or ("[Вложение]" if message.attaches else ""),
                     direction="outbound" if outbound else "inbound", timestamp=message.time / 1000,
-                    peer_name=getattr(chats.get(peer), "title", None),
-                    status="sent" if outbound else "received",
+                    peer_name=catalog[peer].get("name"), status="sent" if outbound else "received",
                     metadata={"has_media": bool(message.attaches), "canonical_peer": peer,
-                              "aliases": self.config.get("_max_peer_aliases", {}).get(peer, [])},
+                              "aliases": self.config.get("_max_peer_aliases", {}).get(peer, []),
+                              "historical": message.time / 1000 <= history["boundary"]},
                 )
+            if history_failed:
+                continue
             oldest = min((message.time for message in messages), default=0)
             if len(messages) < self.PAGE_SIZE or oldest <= cursor["floor"]:
-                # Overlap by a minute so slightly late provider events replay.
                 cursors[peer] = {"watermark": cursor["ceiling"] - 60000}
+                if peer not in history["completed"]:
+                    history["completed"].append(peer)
             elif oldest >= cursor["before"]:
-                # More than one provider page at the same millisecond cannot be
-                # disambiguated by this API. Surface a gap, never skip silently.
-                raise ProviderError("max_history_timestamp_boundary_overflow")
+                # Surface a per-account partial import while still committing
+                # any live messages; never skip an ambiguous timestamp boundary.
+                history["error"] = True
             else:
                 cursor["before"] = oldest
             if peer in dirty and self._dirty_chats.get(peer) == dirty[peer]:
                 self._dirty_chats.pop(peer, None)
         self.config["_max_chat_offset"] = (offset + len(scheduled)) % len(peers)
+        self._history_status()
         return list(events.values())
 
     async def close(self) -> None:

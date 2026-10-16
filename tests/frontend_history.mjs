@@ -21,6 +21,8 @@ function inboxWithMessages(initial, fresh) {
     _messages: initial,
     _connectionLabel: { textContent: '' },
     renderAccounts() {},
+    async loadInbox() { this._conversations = [conversation]; },
+    markVisibleMessagesRead() {},
     renderConversations() {},
     renderMessages() {},
     showError(message) { assert.fail(message); },

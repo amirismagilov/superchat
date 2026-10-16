@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix/mac-local-start]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -91,6 +91,7 @@ jobs:
         run: |
           node tests/frontend_connection.cjs
           node --test tests/frontend_history.mjs
+          node tests/frontend_inbox.cjs
       - name: Build application image and check imports without network
         run: |
           docker build --tag omnicrm:ci .

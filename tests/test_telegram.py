@@ -205,12 +205,12 @@ async def test_start_is_allowed_unauthorized_but_send_requires_login():
 
 
 @pytest.mark.asyncio
-async def test_initial_login_sets_baseline_without_silently_importing_history():
+async def test_initial_login_sets_live_baseline_and_announces_progressive_history():
     a = adapter()
     a.config.pop("tg_cursor")
     a.config.pop("tg_self_id")
     result = await a.auth("login", {})
-    assert result.public["history_import"] == "explicit_sync"
+    assert result.public["history_import"] == "progressive"
     assert a.config["tg_cursor"]["pts"] == 10
     a.client.get_messages.assert_not_awaited()
     assert isinstance(a.client.call.call_args.args[0], functions.updates.GetStateRequest)
@@ -229,7 +229,7 @@ async def test_replayed_difference_and_native_outbound_survive_restart():
     )
     a.client.call.return_value = difference
     first = await a.poll()
-    assert [(e.provider_id, e.direction) for e in first] == [("101", "inbound"), ("102", "outbound")]
+    assert [(e.provider_id, e.direction) for e in first] == [("101", "inbound"), ("102", "outbound"), ("103", "inbound"), ("104", "inbound")]
     assert a.config["tg_cursor"]["pts"] == 20
     assert a.config["tg_entities"]["42"]["hash"] == 9876543
     # A failed DB commit / crash reconstructs from persisted config, so replay is exact.
@@ -364,13 +364,14 @@ async def test_sync_is_explicit_bounded_personal_and_atomic_with_difference():
     a.client.get_messages.return_value = [message(1), message(2, outgoing=True)]
     a.client.call.return_value = types.updates.DifferenceEmpty(NOW, 5)
     events = await a.poll()
-    assert [e.provider_id for e in events] == ["1", "2"]
-    a.client.get_messages.assert_awaited_once_with(types.InputPeerUser(42, 9876543), limit=20)
+    assert [e.provider_id for e in events if not e.metadata.get("conversation_only")] == ["1", "2"]
+    assert {e.peer for e in events if e.metadata.get("conversation_only")} == {"1", "42", "999"}
+    a.client.get_messages.assert_any_await(types.InputPeerUser(42, 9876543), limit=20)
     assert a.config["tg_sync"] == []
 
 
 @pytest.mark.asyncio
-async def test_history_failure_does_not_advance_difference_cursor():
+async def test_history_failure_still_commits_live_difference_and_retains_history_job():
     a = adapter()
     a.config["tg_entities"] = {"42": {"hash": 9876543}}
     a.config["tg_sync"] = ["42"]
@@ -378,10 +379,11 @@ async def test_history_failure_does_not_advance_difference_cursor():
         new_messages=[message(101)], new_encrypted_messages=[], other_updates=[],
         chats=[], users=[user()], state=state(20))
     a.client.get_messages.side_effect = TimeoutError()
-    before = deepcopy(a.config)
-    with pytest.raises(ProviderError):
-        await a.poll()
-    assert a.config == before
+    events = await a.poll()
+    assert [event.provider_id for event in events] == ["101"]
+    assert a.config["tg_cursor"]["pts"] == 20
+    assert a.config["tg_sync"] == ["42"]
+    assert a.config["history_status"]["state"] == "partial"
 
 
 @pytest.mark.asyncio
@@ -535,3 +537,155 @@ async def test_reassigned_phone_cannot_silently_change_recipient():
     assert a.client.call.await_count == 1
     assert isinstance(a.client.call.call_args.args[0], functions.contacts.ResolvePhoneRequest)
     assert a.config["tg_aliases"] == {"41": ["+79990000000"]}
+
+
+@pytest.mark.asyncio
+async def test_progressive_discovery_paginates_cloud_and_archived_empty_dialogs_after_restart():
+    a = adapter()
+    first_page = [SimpleNamespace(entity=user(i), message=message(1000 - i, peer=i)) for i in range(10, 60)]
+    archived = types.Chat(id=77, title="Archived team", photo=types.ChatPhotoEmpty(), participants_count=2, date=NOW, version=1)
+    calls = []
+
+    async def dialogs(**kwargs):
+        calls.append(kwargs)
+        if kwargs["folder"] == 1:
+            return [SimpleNamespace(entity=archived, message=None), SimpleNamespace(entity=user(1, is_self=True), message=None)]
+        return [SimpleNamespace(entity=user(60), message=None)] if "offset_peer" in kwargs else first_page
+
+    all_events = []
+    for _ in range(3):
+        a.client.call.return_value = types.updates.DifferenceEmpty(NOW, 5)
+        a.client.get_dialogs.side_effect = dialogs
+        all_events.extend(await a.poll())
+        a = adapter(deepcopy(a.config))  # Traversal must survive an actual adapter reconstruction.
+    discovered = {event.peer: event for event in all_events if event.metadata.get("conversation_only")}
+    assert len(discovered) == 53
+    assert discovered["-77"].peer_name == "Archived team"
+    assert discovered["1"].peer_name == "Избранное"
+    assert all(not event.provider_id and not event.text for event in discovered.values())
+    assert calls[1]["offset_peer"] == types.InputPeerUser(59, 9876543)
+    assert calls[1]["offset_id"] == 941 and calls[1]["ignore_pinned"] is True
+    assert calls[2]["folder"] == 1
+    assert a.config["tg_history"]["discovery_done"] is True
+    assert a.config["history_status"]["chats_discovered"] == 53
+
+
+@pytest.mark.asyncio
+async def test_history_pages_replay_and_keep_live_difference_independent(monkeypatch):
+    a = adapter()
+    monkeypatch.setattr("app.adapters.telegram.time.time", lambda: NOW.timestamp() + 10)
+    await a.request_history({"history_days": 3650})
+    persisted = deepcopy(a.config)
+    a.client.get_dialogs.return_value = [SimpleNamespace(entity=user(), message=message(300))]
+    live = types.Message(id=999, peer_id=types.PeerUser(42), date=NOW + timedelta(seconds=20), message="Live")
+    difference = types.updates.Difference(new_messages=[live], new_encrypted_messages=[], other_updates=[], chats=[], users=[user()], state=state(20))
+    a.client.call.return_value = difference
+    a.client.get_messages.return_value = [message(i) for i in range(300, 200, -1)]
+    first = await a.poll()
+    replay = adapter(persisted)
+    replay.client.call.return_value = difference
+    replay.client.get_dialogs.return_value = a.client.get_dialogs.return_value
+    replay.client.get_messages.return_value = a.client.get_messages.return_value
+    assert await replay.poll() == first
+    assert a.config["tg_history"]["chats"]["42"]["before"] == 201
+    assert a.config["tg_cursor"]["pts"] == 20
+    assert next(event for event in first if event.provider_id == "999").metadata["historical"] is False
+    assert all(event.metadata["historical"] for event in first if event.provider_id and event.provider_id != "999")
+    restarted = adapter(deepcopy(a.config))
+    restarted.client.call.return_value = types.updates.DifferenceEmpty(NOW, 5)
+    restarted.client.get_messages.return_value = [message(200)]
+    await restarted.poll()
+    assert restarted.client.get_messages.call_args.kwargs["offset_id"] == 201
+    assert restarted.config["tg_history"]["chats"]["42"]["done"] is True
+
+
+@pytest.mark.asyncio
+async def test_manual_history_recovers_explicit_difference_gap_before_snapshot():
+    a = adapter()
+    old_cursor = deepcopy(a.config["tg_cursor"])
+    await a.request_history({"history_days": 3650})
+    assert a.config["tg_cursor"] == old_cursor  # Ordinary manual import never resets live delivery.
+    a.client.call.side_effect = [types.updates.DifferenceTooLong(9999), state(10000)]
+    a.client.get_dialogs.return_value = [SimpleNamespace(entity=user(), message=message(20))]
+    a.client.get_messages.return_value = [message(20)]
+    events = await a.poll()
+    assert [event.provider_id for event in events if event.provider_id] == ["20"]
+    assert a.config["tg_cursor"]["pts"] == 10000
+    assert a.config["tg_history"]["recovered_gap"] is True
+    assert "tg_history_recover_gap" not in a.config
+    assert isinstance(a.client.call.call_args_list[1].args[0], functions.updates.GetStateRequest)
+    a.client.call.side_effect = None
+    a.client.call.return_value = types.updates.DifferenceEmpty(NOW, 6)
+    await a.poll()
+    assert a.client.call.call_args.args[0].pts == 10000
+
+
+@pytest.mark.asyncio
+async def test_channel_live_cursor_is_distinct_from_backfill_and_ids_are_per_peer():
+    a = adapter()
+    channel = types.Channel(id=88, title="Team", photo=types.ChatPhotoEmpty(), date=NOW, access_hash=777, megagroup=True)
+    a.client.get_dialogs.return_value = [SimpleNamespace(entity=channel, message=SimpleNamespace(id=100))]
+    a.client.call.return_value = types.updates.Difference(new_messages=[message(101)], new_encrypted_messages=[], other_updates=[], chats=[], users=[user()], state=state(20))
+    old = types.Message(id=90, peer_id=types.PeerChannel(88), date=NOW, message="Old group")
+    new = types.Message(id=101, peer_id=types.PeerChannel(88), date=NOW, message="New group")
+
+    async def messages(entity, **kwargs):
+        assert entity == types.InputPeerChannel(88, 777)
+        if kwargs.get("reverse"):
+            assert kwargs["min_id"] == 100
+            return [new]
+        return [old]
+
+    a.client.get_messages.side_effect = messages
+    events = await a.poll()
+    assert {(event.peer, event.provider_id) for event in events if event.provider_id} == {
+        ("42", "101"), ("-1000000000088", "90"), ("-1000000000088", "101")}
+    assert a.config["tg_live_channels"]["-1000000000088"] == 101
+    assert await a._resolve_peer("-1000000000088") == types.InputPeerChannel(88, 777)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("days", [0, 3651, True, "30", 1.5])
+async def test_history_depth_is_validated_before_mutation(days):
+    a = adapter()
+    before = deepcopy(a.config)
+    with pytest.raises(ProviderError, match="history_days_invalid"):
+        await a.request_history({"history_days": days})
+    assert a.config == before
+
+
+@pytest.mark.asyncio
+async def test_channel_top_message_from_same_second_is_not_lost_between_live_and_history(monkeypatch):
+    monkeypatch.setattr("app.adapters.telegram.time.time", lambda: NOW.timestamp() + 0.25)
+    a = adapter()
+    channel = types.Channel(id=88, title="Team", photo=types.ChatPhotoEmpty(), date=NOW, access_hash=777)
+    top = types.Message(id=100, peer_id=types.PeerChannel(88), date=NOW, message="At discovery second")
+    a.client.get_dialogs.return_value = [SimpleNamespace(entity=channel, message=top)]
+    a.client.call.return_value = types.updates.DifferenceEmpty(NOW, 5)
+    async def messages(_entity, **kwargs):
+        if kwargs.get("reverse"):
+            return []  # min_id is exclusive and has already reached top_id.
+        # Actual Telegram GetHistory offset_date is exclusive integer seconds.
+        assert int(kwargs["offset_date"].timestamp()) == int(NOW.timestamp()) + 1
+        return [top] if top.date.timestamp() < int(kwargs["offset_date"].timestamp()) else []
+    a.client.get_messages.side_effect = messages
+    events = await a.poll()
+    assert [event.provider_id for event in events if event.provider_id] == ["100"]
+    assert a.config["tg_history"]["chats"]["-1000000000088"]["done"] is True
+
+
+@pytest.mark.asyncio
+async def test_provider_dialog_title_refresh_emits_metadata_event_without_fake_message(monkeypatch):
+    clock = [NOW.timestamp()]
+    monkeypatch.setattr("app.adapters.telegram.time.time", lambda: clock[0])
+    a = adapter()
+    a.client.call.return_value = types.updates.DifferenceEmpty(NOW, 5)
+    a.client.get_dialogs.return_value = [SimpleNamespace(entity=user(), message=None)]
+    await a.poll()
+    await a.poll()
+    clock[0] += 61
+    a.client.get_dialogs.return_value[0].entity.first_name = "Changed provider name"
+    events = await a.poll()
+    assert len(events) == 1
+    assert events[0].metadata["conversation_only"] and events[0].peer_name == "Changed provider name"
+    assert events[0].text == "" and events[0].provider_id == ""
