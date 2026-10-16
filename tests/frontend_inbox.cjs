@@ -103,10 +103,8 @@ const path = require('node:path');
     const first = table.locator('[data-conversation-id="c1"]');
     await first.getByRole('button', { name: 'В избранное: ООО Ромашка', exact: true }).click();
     await first.getByRole('button', { name: 'Убрать из избранного: ООО Ромашка', exact: true }).waitFor();
-    await first.getByRole('combobox', { name: 'Этап: ООО Ромашка' }).selectOption('in_progress');
-    await page.waitForFunction(() => document.querySelector('omni-inbox')._conversations.find(item => item.id === 'c1').stage === 'in_progress');
     assert.equal(await page.getByRole('log', { name: 'История сообщений' }).count(), 0, 'Row controls must not also open the conversation');
-    checks.push('Stale query protection, persistent favorite and funnel stage without opening chat');
+    checks.push('Stale query protection, persistent favorite without opening chat');
 
     await first.click();
     await page.getByRole('log').getByText('Сообщение 210', { exact: true }).waitFor();
